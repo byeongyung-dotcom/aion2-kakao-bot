@@ -13,7 +13,7 @@ app = FastAPI(title="AION2 Kakao Skill Server v2")
 # -----------------------------
 # Fixed settings
 # -----------------------------
-NOTMETER_API = "https://notmeter59-27-108-81.sslip.io"
+NOTMETER_API = "https://notmeter.59-27-108-81.sslip.io"
 SERVER_ID = 2002
 SERVER_NAME = "지켈"
 
