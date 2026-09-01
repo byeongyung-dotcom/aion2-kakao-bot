@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: aion2-kakao-skill
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
