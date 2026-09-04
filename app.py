@@ -1,0 +1,3554 @@
+
+import asyncio
+import os
+import json
+import gzip
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import quote, unquote
+from html import escape, unescape
+from html.parser import HTMLParser
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+
+app = FastAPI(title="AION2 Server v31 OfficialAPI")
+
+# =========================================================
+# Common
+# =========================================================
+
+SERVER_ID = 2002
+SERVER_NAME = "지켈"
+KST = ZoneInfo("Asia/Seoul")
+
+# Character API - current NotMeter endpoint
+NOTMETER_API = "https://notmeter.59-27-108-81.sslip.io"
+
+# Field boss public cache.
+# NotMeter itself uses GitHub first, then its VPS endpoint.
+FIELD_BOSS_URLS = [
+    "https://raw.githubusercontent.com/Not4You-Dev/NotMeter-Web/main/presence/notmeter-field-boss-public.json",
+    f"{NOTMETER_API}/field-boss/v1/public",
+]
+
+HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Origin": "https://notmeter.com",
+    "Referer": "https://notmeter.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36"
+    ),
+}
+
+PLAYNC_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Origin": "https://aion2.plaync.com",
+    "Referer": "https://aion2.plaync.com/",
+    "User-Agent": HEADERS["User-Agent"],
+}
+
+HTTP_TIMEOUT = httpx.Timeout(connect=2.0, read=6.0, write=2.0, pool=2.0)
+
+CACHE_TTL = 180
+FIELD_BOSS_CACHE_TTL = 120
+_cache = {}
+_http_client = None
+
+def kakao_text(text: str):
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {
+                    "simpleText": {
+                        "text": text[:1000]
+                    }
+                }
+            ]
+        }
+    }
+
+def clean_command(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+def cache_get(key, ttl=CACHE_TTL):
+    item = _cache.get(key)
+    if not item:
+        return None
+    saved, value = item
+    if time.time() - saved > ttl:
+        _cache.pop(key, None)
+        return None
+    return value
+
+def cache_set(key, value):
+    _cache[key] = (time.time(), value)
+
+async def get_http_client():
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            headers=HEADERS,
+            timeout=HTTP_TIMEOUT,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
+
+async def http_json(url: str, params=None, timeout=None):
+    client = await get_http_client()
+    response = await client.get(url, params=params, timeout=timeout or HTTP_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+# =========================================================
+# Character search - ALL Korean servers / optimized
+# =========================================================
+
+PERCENT_STONE_IDS = {
+    "AmplifyWeaponDamage",
+    "AmplifyCriticalDamage",
+    "AmplifyBackAttack",
+    "AmplifyFrontAttack",
+}
+
+STONE_ORDER = [
+    "무기 피해 증폭",
+    "치명타 피해 증폭",
+    "후방 피해 증폭",
+    "전방 피해 증폭",
+    "공격력",
+    "치명타",
+    "치명타 저항",
+    "추가 명중",
+    "막기",
+    "방어력",
+    "생명력",
+    "추가 회피",
+    "정신력",
+]
+
+def number_from_value(value):
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", str(value or ""))
+    return float(m.group()) if m else 0.0
+
+def pretty_number(v):
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    return f"{v:.1f}".rstrip("0").rstrip(".")
+
+async def character_api_get(path, params, timeout=None):
+    return await http_json(NOTMETER_API + path, params=params, timeout=timeout)
+
+def parse_character_query(text: str):
+    text = str(text or "").strip()
+    m = re.match(r"^(.+?)\[(.+?)\]$", text)
+    if not m:
+        return text, None
+    return m.group(1).strip(), m.group(2).strip()
+
+def row_name(row):
+    return str(row.get("name") or row.get("characterName") or "").strip()
+
+def row_server_name(row):
+    return str(
+        row.get("serverName")
+        or row.get("server")
+        or row.get("worldName")
+        or ""
+    ).strip()
+
+def row_server_id(row):
+    try:
+        return int(row.get("serverId") or 0)
+    except Exception:
+        return 0
+
+def row_character_id(row):
+    return str(
+        row.get("characterId")
+        or row.get("id")
+        or row.get("characterKey")
+        or ""
+    ).strip()
+
+async def search_characters_all_servers(nickname: str):
+    cache_key = f"char-search:{nickname.casefold()}"
+    cached = cache_get(cache_key, 180)
+    if cached is not None:
+        return cached
+
+    data = await character_api_get(
+        "/character/v1/search",
+        {
+            "name": nickname,
+            "region": "kr",
+            "lang": "ko",
+            "fast": "1",
+        },
+        timeout=httpx.Timeout(connect=1.0, read=2.8, write=1.0, pool=1.0),
+    )
+
+    results = data.get("results") or data.get("characters") or []
+    target = nickname.casefold()
+
+    exact = [
+        row for row in results
+        if isinstance(row, dict) and row_name(row).casefold() == target
+    ]
+
+    exact.sort(
+        key=lambda row: (
+            0 if row_name(row) == nickname else 1,
+            -int(row.get("combatPower") or 0),
+            row_server_id(row) or 999999,
+        )
+    )
+    cache_set(cache_key, exact)
+    return exact
+
+async def get_profile(server_id: int, character_id: str, fast=False):
+    params = {
+        "serverId": int(server_id),
+        "characterId": character_id,
+        "region": "kr",
+        "lang": "ko",
+    }
+    if fast:
+        params["fast"] = "1"
+
+    timeout = (
+        httpx.Timeout(connect=1.0, read=2.5, write=1.0, pool=1.0)
+        if fast
+        else httpx.Timeout(connect=1.0, read=4.2, write=1.0, pool=1.0)
+    )
+    return await character_api_get("/character/v1/profile", params, timeout=timeout)
+
+def _collect_stone_lists(node, out, depth=0):
+    if depth > 10:
+        return
+    if isinstance(node, dict):
+        stones = node.get("magicStoneStat")
+        if isinstance(stones, list):
+            out.append(stones)
+        for key, value in node.items():
+            if key != "magicStoneStat" and isinstance(value, (dict, list)):
+                _collect_stone_lists(value, out, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            if isinstance(value, (dict, list)):
+                _collect_stone_lists(value, out, depth + 1)
+
+def aggregate_magic_stones(profile_json):
+    totals = defaultdict(float)
+    ids_by_name = {}
+    stone_lists = []
+
+    item_details = profile_json.get("itemDetails")
+    if isinstance(item_details, dict):
+        for item in item_details.values():
+            if isinstance(item, dict):
+                stones = item.get("magicStoneStat")
+                if isinstance(stones, list):
+                    stone_lists.append(stones)
+    elif isinstance(item_details, list):
+        for item in item_details:
+            if isinstance(item, dict):
+                stones = item.get("magicStoneStat")
+                if isinstance(stones, list):
+                    stone_lists.append(stones)
+
+    if not stone_lists:
+        _collect_stone_lists(profile_json, stone_lists)
+
+    # Deduplicate by content instead of Python object identity.
+    seen = set()
+    for stones in stone_lists:
+        for stone in stones:
+            if not isinstance(stone, dict):
+                continue
+            stat_id = str(stone.get("id") or "").strip()
+            name = str(stone.get("name") or "").strip()
+            value_raw = str(stone.get("value") or "").strip()
+            key = (stat_id, name, value_raw, str(stone.get("icon") or ""))
+            if not name:
+                continue
+            # Same stat may legitimately occur on multiple equipment pieces.
+            # Do not dedupe identical values across different pieces.
+            totals[name] += number_from_value(value_raw)
+            ids_by_name[name] = stat_id
+
+    formatted = []
+    used = set()
+
+    for name in STONE_ORDER:
+        if name not in totals:
+            continue
+        value = totals[name]
+        stat_id = ids_by_name.get(name, "")
+        if stat_id in PERCENT_STONE_IDS:
+            formatted.append((name, f"+{pretty_number(value / 100.0)}%"))
+        else:
+            formatted.append((name, f"+{pretty_number(value)}"))
+        used.add(name)
+
+    for name, value in totals.items():
+        if name in used:
+            continue
+        stat_id = ids_by_name.get(name, "")
+        if stat_id in PERCENT_STONE_IDS:
+            formatted.append((name, f"+{pretty_number(value / 100.0)}%"))
+        else:
+            formatted.append((name, f"+{pretty_number(value)}"))
+
+    return formatted
+
+def profile_info(profile_json, requested_name="", fallback_server="", fallback_row=None):
+    profile = (profile_json.get("info") or {}).get("profile") or {}
+    fallback_row = fallback_row or {}
+
+    combat_power = (
+        profile.get("combatPower")
+        or fallback_row.get("combatPower")
+        or fallback_row.get("power")
+        or 0
+    )
+
+    return {
+        "name": profile.get("characterName") or row_name(fallback_row) or requested_name,
+        "job": profile.get("className") or fallback_row.get("className") or fallback_row.get("job") or "확인 실패",
+        "combatPower": int(combat_power or 0),
+        "serverId": int(profile.get("serverId") or row_server_id(fallback_row) or 0),
+        "server": profile.get("serverName") or row_server_name(fallback_row) or fallback_server or "확인 실패",
+        "level": int(profile.get("characterLevel") or fallback_row.get("level") or 0),
+        "race": profile.get("raceName") or "",
+        "title": profile.get("titleName") or "",
+        "profileImage": profile.get("profileImage") or fallback_row.get("profileImage") or "",
+    }
+
+def character_card_url(name, server):
+    return (
+        "https://aion2-kakao-bot.onrender.com/c/"
+        + quote(str(name), safe="")
+        + "/"
+        + quote(str(server), safe="")
+    )
+
+def format_character_from_data(info, stones):
+    name = str(info.get("name") or "").strip()
+    server = str(info.get("server") or "").strip()
+    job = str(info.get("job") or "").strip()
+    cp = int(info.get("combatPower") or 0)
+
+    if not name:
+        return None
+
+    cp_short = round(cp / 1000) if cp else 0
+
+    line2 = " · ".join(
+        [x for x in (server, job, str(cp_short) if cp_short else "") if x]
+    )
+
+    lines = [f"⚔️ {name}"]
+    if line2:
+        lines.append(line2)
+
+    if server:
+        lines += [
+            "",
+            "🖼 프로필 보기",
+            character_card_url(name, server),
+        ]
+
+    return "\n".join(lines)
+
+
+async def load_detail(row, nickname):
+    sid = row_server_id(row)
+    cid = row_character_id(row)
+    if not sid or not cid:
+        return {
+            "row": row,
+            "profile": {},
+            "info": profile_info({}, nickname, row_server_name(row), row),
+            "stones": [],
+        }
+
+    profile = {}
+    try:
+        # Full profile first because this contains itemDetails/magicStoneStat.
+        profile = await get_profile(sid, cid, fast=False)
+    except Exception:
+        # Never turn a valid search hit into "not found".
+        try:
+            profile = await get_profile(sid, cid, fast=True)
+        except Exception:
+            profile = {}
+
+    info = profile_info(profile, nickname, row_server_name(row), row)
+    stones = aggregate_magic_stones(profile) if profile else []
+
+    return {
+        "row": row,
+        "profile": profile,
+        "info": info,
+        "stones": stones,
+    }
+
+async def resolve_character(nickname: str, server_name: str | None = None):
+    candidates = await search_characters_all_servers(nickname)
+
+    if server_name:
+        target = server_name.casefold()
+
+        # Fast path when search response contains serverName.
+        named = [
+            row for row in candidates
+            if row_server_name(row) and row_server_name(row).casefold() == target
+        ]
+        if named:
+            candidates = named
+        else:
+            # Search response may omit serverName. Only inspect rows until matched.
+            checked = await asyncio.gather(
+                *[load_detail(row, nickname) for row in candidates[:12]]
+            )
+            matched = [
+                d for d in checked
+                if str(d["info"]["server"]).casefold() == target
+            ]
+            if not matched:
+                return {"type": "none"}
+            return {"type": "detail", **matched[0]}
+
+    if not candidates:
+        return {"type": "none"}
+
+    if len(candidates) == 1:
+        detail = await load_detail(candidates[0], nickname)
+        return {"type": "detail", **detail}
+
+    # Duplicate nickname: DO NOT fetch every full profile.
+    # Search API result is enough to show server choices, which is much faster.
+    items = []
+    for row in candidates[:12]:
+        info = profile_info({}, nickname, row_server_name(row), row)
+        items.append({"row": row, "info": info})
+
+    # If server names are absent, fetch FAST profiles concurrently only.
+    if any(not item["info"]["server"] or item["info"]["server"] == "확인 실패" for item in items):
+        async def enrich(item):
+            row = item["row"]
+            sid = row_server_id(row)
+            cid = row_character_id(row)
+            if not sid or not cid:
+                return item
+            try:
+                p = await get_profile(sid, cid, fast=True)
+                item["info"] = profile_info(p, nickname, row_server_name(row), row)
+            except Exception:
+                pass
+            return item
+
+        items = await asyncio.gather(*[enrich(item) for item in items])
+
+    items.sort(key=lambda x: x["info"]["combatPower"], reverse=True)
+    return {"type": "multiple", "items": items}
+
+def format_character_multiple(nickname, items):
+    lines = [f"🔎 {nickname} · 전 서버", ""]
+
+    for item in items[:10]:
+        info = item["info"]
+        cp = round(info["combatPower"] / 1000) if info["combatPower"] else "-"
+        lines.append(f"• {info['server']} · {info['job']} · {cp}")
+
+    lines += [
+        "",
+        f"예) !지켈{nickname}",
+        f"예) !{nickname}지켈",
+    ]
+    return "\n".join(lines)
+
+
+# =========================================================
+# Full server-name character search
+# !윤이시엘 / !시엘윤이 / !윤이지켈 / !지켈윤이
+# =========================================================
+
+# NotMeter/AION2 server lists are sequential:
+# Elyos  = 1001 + index
+# Asmodian = 2001 + index
+SERVER_NAMES_ELYOS = (
+    "시엘", "네자칸", "바이젤", "카이시넬", "유스티엘", "아리엘", "프레기온", "메스람타에다",
+    "히타니에", "나니아", "타하바타", "루터스", "페르노스", "다미누", "카사카", "바카르마",
+    "챈가룽", "코치룽", "이슈타르", "티아마트", "포에타", "베르테론", "나트하라", "탈리스라",
+    "주미온", "나히드", "아사르", "칼리드", "라세이스", "페리온", "드라마타", "레다", "아울도르",
+    "바크론", "나룬", "가르투아", "클로리스", "이오네", "테이나", "디모네스", "바고트", "아테론",
+    "루틸리스", "실리아토르", "이드리스", "사티아", "에스티안", "라후", "라누만", "히브란",
+    "우라훔", "라크슈미", "타몬", "티에", "두두리", "데르코스", "둔둔몽", "홀리아울",
+)
+
+SERVER_NAMES_ASMODIAN = (
+    "이스라펠", "지켈", "트리니엘", "루미엘", "마르쿠탄", "아스펠", "에레슈키갈", "브리트라",
+    "네몬", "하달", "루드라", "울고른", "무닌", "오다르", "젠카카", "크로메데", "콰이링",
+    "바바룽", "파프니르", "인드나흐", "이스할겐", "알트가르드", "아그니타", "아티엘", "발데마르",
+    "라그타", "게로드", "우르드", "에코", "지젤", "카샤파", "스토프", "베르크", "누아쿰",
+    "그리실라", "산트라스", "루벤", "휴고", "크라키", "히스탄", "라트만", "시게베르트",
+    "나즈문", "겔코스", "파톤", "펠레이르", "엘비다", "케투", "파이디온", "노툰", "무르트",
+    "로탄", "쿠하푸", "두안카", "브로크", "왈터", "푸라킨", "이그누스",
+)
+
+SERVER_ID_MAP = {}
+
+for index, name in enumerate(SERVER_NAMES_ELYOS):
+    SERVER_ID_MAP[name] = 1001 + index
+
+for index, name in enumerate(SERVER_NAMES_ASMODIAN):
+    SERVER_ID_MAP[name] = 2001 + index
+
+SERVER_NAMES = tuple(SERVER_ID_MAP.keys())
+
+
+# =========================================================
+# Official AION2 character source - DIRECT JSON API
+# =========================================================
+
+OFFICIAL_CHARACTER_BASE = "https://aion2.plaync.com"
+
+OFFICIAL_CHARACTER_SEARCH_API = (
+    OFFICIAL_CHARACTER_BASE +
+    "/ko-kr/api/search/aion2/search/v2/character"
+)
+
+OFFICIAL_CHARACTER_INFO_API = (
+    OFFICIAL_CHARACTER_BASE +
+    "/api/character/info"
+)
+
+OFFICIAL_API_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+    "Referer": "https://aion2.plaync.com/ko-kr/characters/index",
+    "User-Agent": HEADERS["User-Agent"],
+}
+
+AION2_JOB_NAMES = (
+    "검성", "수호성", "살성", "궁성",
+    "마도성", "정령성", "치유성", "호법성", "권성",
+)
+
+SERVER_NAME_BY_ID = {
+    int(server_id): name
+    for name, server_id in SERVER_ID_MAP.items()
+}
+
+
+def _official_server_race(server_id):
+    try:
+        server_id = int(server_id)
+    except Exception:
+        return None
+
+    return 1 if server_id < 2000 else 2
+
+
+def _strip_html(value):
+    value = str(value or "")
+    value = re.sub(r"<[^>]+>", "", value)
+    return unescape(value).strip()
+
+
+async def _official_get_json(url, params=None, timeout=None):
+    client = await get_http_client()
+
+    response = await client.get(
+        url,
+        params=params,
+        headers=OFFICIAL_API_HEADERS,
+        timeout=timeout or httpx.Timeout(
+            connect=3.0,
+            read=12.0,
+            write=3.0,
+            pool=2.0,
+        ),
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+
+async def official_search_characters(nickname, server_name=None):
+    nickname = str(nickname or "").strip()
+    server_name = str(server_name or "").strip() or None
+
+    if not nickname:
+        return []
+
+    cache_key = (
+        f"official-char-search:{nickname.casefold()}:"
+        f"{(server_name or '*').casefold()}"
+    )
+
+    cached = cache_get(cache_key, 180)
+    if cached is not None:
+        return cached
+
+    async def fetch_one(race, server_id=""):
+        try:
+            data = await _official_get_json(
+                OFFICIAL_CHARACTER_SEARCH_API,
+                params={
+                    "keyword": nickname,
+                    "race": int(race),
+                    "serverId": int(server_id) if server_id else "",
+                },
+            )
+
+            rows = []
+
+            for item in (data.get("list") or []):
+                item_name = _strip_html(item.get("name"))
+
+                if item_name.casefold() != nickname.casefold():
+                    continue
+
+                sid = item.get("serverId") or server_id
+
+                try:
+                    sid = int(sid)
+                except Exception:
+                    continue
+
+                char_id = (
+                    item.get("characterId")
+                    or item.get("charId")
+                    or item.get("id")
+                    or ""
+                )
+
+                char_id = unquote(str(char_id or "").strip())
+
+                if not char_id:
+                    continue
+
+                row_server_name = (
+                    _strip_html(item.get("serverName"))
+                    or SERVER_NAME_BY_ID.get(sid, "")
+                )
+
+                class_name = (
+                    _strip_html(item.get("className"))
+                    or _strip_html(item.get("jobName"))
+                )
+
+                level = (
+                    item.get("characterLevel")
+                    or item.get("level")
+                    or 0
+                )
+
+                try:
+                    level = int(level)
+                except Exception:
+                    level = 0
+
+                rows.append({
+                    "name": item_name,
+                    "serverName": row_server_name,
+                    "serverId": sid,
+                    "className": class_name,
+                    "characterLevel": level,
+                    "characterId": char_id,
+                    "officialUrl": (
+                        f"{OFFICIAL_CHARACTER_BASE}/ko-kr/characters/"
+                        f"{sid}/{quote(char_id, safe='')}"
+                    ),
+                })
+
+            return rows
+
+        except Exception:
+            return []
+
+    rows = []
+
+    if server_name:
+        server_id = SERVER_ID_MAP.get(server_name)
+
+        if not server_id:
+            return []
+
+        race = _official_server_race(server_id)
+
+        rows = await fetch_one(
+            race,
+            server_id,
+        )
+
+        rows = [
+            row
+            for row in rows
+            if (
+                str(row.get("name") or "").casefold()
+                ==
+                nickname.casefold()
+                and
+                int(row.get("serverId") or 0)
+                ==
+                int(server_id)
+            )
+        ]
+
+    else:
+        elyos_rows, asmo_rows = await asyncio.gather(
+            fetch_one(1, ""),
+            fetch_one(2, ""),
+        )
+
+        rows = elyos_rows + asmo_rows
+
+        rows = [
+            row
+            for row in rows
+            if str(row.get("name") or "").casefold()
+            ==
+            nickname.casefold()
+        ]
+
+    unique = {}
+
+    for row in rows:
+        key = (
+            int(row.get("serverId") or 0),
+            str(row.get("characterId") or ""),
+        )
+        unique[key] = row
+
+    rows = list(unique.values())
+
+    rows.sort(
+        key=lambda row: (
+            int(row.get("serverId") or 999999),
+            str(row.get("className") or ""),
+        )
+    )
+
+    cache_set(cache_key, rows)
+    return rows
+
+
+async def official_load_detail(row):
+    server_id = int(row.get("serverId") or 0)
+    character_id = str(row.get("characterId") or "")
+
+    cache_key = (
+        f"official-char-detail:"
+        f"{server_id}:{character_id}"
+    )
+
+    cached = cache_get(cache_key, 180)
+    if cached is not None:
+        return cached
+
+    info = {
+        "name": str(row.get("name") or ""),
+        "server": str(row.get("serverName") or ""),
+        "serverId": server_id,
+        "characterId": character_id,
+        "job": str(row.get("className") or ""),
+        "combatPower": 0,
+        "itemLevel": 0,
+        "level": int(row.get("characterLevel") or 0),
+        "race": "천족" if server_id < 2000 else "마족",
+        "profileImage": "",
+        "officialUrl": str(row.get("officialUrl") or ""),
+    }
+
+    try:
+        data = await _official_get_json(
+            OFFICIAL_CHARACTER_INFO_API,
+            params={
+                "lang": "ko",
+                "characterId": character_id,
+                "serverId": server_id,
+            },
+        )
+
+        profile = data.get("profile") or {}
+
+        cp = (
+            profile.get("combatPower")
+            or data.get("combatPower")
+            or 0
+        )
+
+        try:
+            cp = int(str(cp).replace(",", ""))
+        except Exception:
+            cp = 0
+
+        job = (
+            profile.get("className")
+            or data.get("className")
+            or info["job"]
+        )
+
+        level = (
+            profile.get("level")
+            or profile.get("characterLevel")
+            or data.get("level")
+            or info["level"]
+        )
+
+        try:
+            level = int(level)
+        except Exception:
+            level = info["level"]
+
+        item_level = (
+            profile.get("itemLevel")
+            or data.get("itemLevel")
+            or 0
+        )
+
+        try:
+            item_level = int(str(item_level).replace(",", ""))
+        except Exception:
+            item_level = 0
+
+        profile_image = (
+            profile.get("profileImage")
+            or profile.get("imageUrl")
+            or data.get("profileImage")
+            or ""
+        )
+
+        server_name = (
+            profile.get("serverName")
+            or data.get("serverName")
+            or info["server"]
+        )
+
+        char_name = (
+            profile.get("name")
+            or profile.get("characterName")
+            or data.get("name")
+            or info["name"]
+        )
+
+        info.update({
+            "name": _strip_html(char_name),
+            "server": _strip_html(server_name),
+            "job": _strip_html(job),
+            "combatPower": cp,
+            "itemLevel": item_level,
+            "level": level,
+            "profileImage": str(profile_image or ""),
+        })
+
+    except Exception:
+        pass
+
+    cache_set(cache_key, info)
+    return info
+
+
+async def official_resolve_character(nickname, server_name=None):
+    rows = await official_search_characters(
+        nickname,
+        server_name=server_name,
+    )
+
+    if not rows:
+        return {"type": "none"}
+
+    if len(rows) == 1:
+        info = await official_load_detail(rows[0])
+
+        return {
+            "type": "detail",
+            "row": rows[0],
+            "profile": {},
+            "info": info,
+            "stones": [],
+        }
+
+    details = await asyncio.gather(
+        *[
+            official_load_detail(row)
+            for row in rows[:20]
+        ]
+    )
+
+    items = []
+
+    for row, info in zip(
+        rows[:20],
+        details,
+    ):
+        items.append({
+            "row": row,
+            "info": info,
+        })
+
+    items.sort(
+        key=lambda x: int(
+            x["info"].get("combatPower") or 0
+        ),
+        reverse=True,
+    )
+
+    return {
+        "type": "multiple",
+        "items": items,
+    }
+
+
+async def official_character_lookup_smart(body):
+    body = str(body or "").strip()
+
+    nickname, explicit_server = parse_character_query(body)
+
+    if explicit_server:
+        resolved = await official_resolve_character(
+            nickname,
+            explicit_server,
+        )
+
+    else:
+        parsed = split_server_and_nickname(body)
+
+        if parsed:
+            nickname, server_name = parsed
+
+            resolved = await official_resolve_character(
+                nickname,
+                server_name,
+            )
+
+        else:
+            nickname = body
+
+            resolved = await official_resolve_character(
+                nickname,
+                None,
+            )
+
+    if resolved["type"] == "none":
+        return None
+
+    if resolved["type"] == "multiple":
+        return format_character_multiple(
+            nickname,
+            resolved["items"],
+        )
+
+    return format_character_from_data(
+        resolved["info"],
+        [],
+    )
+
+
+def split_server_and_nickname(text: str):
+    """
+    서버명을 닉네임 앞/뒤 어느 쪽에 붙여도 인식.
+      윤이시엘 -> ("윤이", "시엘")
+      시엘윤이 -> ("윤이", "시엘")
+      윤이지켈 -> ("윤이", "지켈")
+      지켈윤이 -> ("윤이", "지켈")
+    """
+    text = str(text or "").strip()
+    folded = text.casefold()
+
+    # 긴 서버명을 먼저 검사해서 짧은 이름 오인식 최소화
+    for server in sorted(SERVER_NAMES, key=len, reverse=True):
+        sf = server.casefold()
+
+        if folded.startswith(sf) and len(text) > len(server):
+            nickname = text[len(server):].strip()
+            if nickname:
+                return nickname, server
+
+        if folded.endswith(sf) and len(text) > len(server):
+            nickname = text[:-len(server)].strip()
+            if nickname:
+                return nickname, server
+
+    return None
+
+
+async def search_character_on_server(nickname: str, server_name: str):
+    """
+    특정 서버 검색.
+    1) serverId를 넣은 검색을 먼저 시도
+    2) 결과가 없으면 전 서버 검색으로 fallback
+    """
+    target_id = SERVER_ID_MAP.get(server_name)
+    target_name = server_name.casefold()
+    target_nickname = nickname.casefold()
+
+    rows = []
+
+    if target_id:
+        try:
+            data = await character_api_get(
+                "/character/v1/search",
+                {
+                    "name": nickname,
+                    "serverId": target_id,
+                    "region": "kr",
+                    "lang": "ko",
+                    "fast": "1",
+                },
+                timeout=httpx.Timeout(
+                    connect=1.0,
+                    read=3.2,
+                    write=1.0,
+                    pool=1.0,
+                ),
+            )
+
+            rows = data.get("results") or data.get("characters") or []
+        except Exception:
+            rows = []
+
+    # Direct search result
+    matched = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        if row_name(row).casefold() != target_nickname:
+            continue
+
+        sid = row_server_id(row)
+        sname = row_server_name(row)
+
+        if target_id and sid == target_id:
+            matched.append(row)
+        elif sname and sname.casefold() == target_name:
+            matched.append(row)
+
+    if matched:
+        return matched
+
+    # Fallback: regular all-server exact-name search
+    all_rows = await search_characters_all_servers(nickname)
+
+    for row in all_rows:
+        sid = row_server_id(row)
+        sname = row_server_name(row)
+
+        if target_id and sid == target_id:
+            matched.append(row)
+        elif sname and sname.casefold() == target_name:
+            matched.append(row)
+
+    return matched
+
+
+async def character_lookup_server_fast(nickname: str, server_name: str):
+    nickname = str(nickname or "").strip()
+    server_name = str(server_name or "").strip()
+
+    if not nickname or server_name not in SERVER_ID_MAP:
+        return None
+
+    matched = await search_character_on_server(
+        nickname,
+        server_name,
+    )
+
+    if not matched:
+        return None
+
+    matched.sort(
+        key=lambda row: int(row.get("combatPower") or 0),
+        reverse=True,
+    )
+
+    # 상세 프로필은 최종 선택 1명만 조회
+    detail = await load_detail(matched[0], nickname)
+
+    return format_character_from_data(
+        detail["info"],
+        detail.get("stones") or [],
+    )
+
+
+async def character_lookup_smart(body: str):
+    return await official_character_lookup_smart(body)
+
+
+async def character_lookup(nickname_query: str):
+    return await official_character_lookup_smart(nickname_query)
+
+
+async def character_card_data(nickname: str, server_name: str):
+    resolved = await official_resolve_character(nickname, server_name)
+    if resolved["type"] != "detail":
+        return None
+    return {
+        "info": resolved["info"],
+        "stones": [],
+    }
+
+
+# =========================================================
+# NotMeter ranking (server-side; phone never downloads gzip)
+# =========================================================
+RANKING_URLS = [
+    # Current NotMeter-Update published ranking cache
+    "https://raw.githubusercontent.com/Not4You-Dev/NotMeter-Update/main/ranking/notmeter-ranking.json",
+
+    # Legacy fallbacks
+    "https://notmeter.com/data/notmeter-ranking.json.gz",
+    "https://raw.githubusercontent.com/Not4You-Dev/NotMeter-Update/main/docs/data/notmeter-ranking.json.gz",
+]
+RANKING_CACHE_TTL = 300
+
+async def fetch_ranking_cache():
+    cached = cache_get("notmeter-ranking-cache", RANKING_CACHE_TTL)
+    if cached is not None:
+        return cached
+    client = await get_http_client()
+    last_error = None
+    for url in RANKING_URLS:
+        try:
+            res = await client.get(
+                url,
+                headers={**HEADERS, "Accept-Encoding": "identity"},
+                timeout=httpx.Timeout(connect=3.0, read=30.0, write=3.0, pool=2.0),
+            )
+            res.raise_for_status()
+            raw = res.content
+            if len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode("utf-8"))
+            cache_set("notmeter-ranking-cache", data)
+            return data
+        except Exception as e:
+            last_error = e
+    raise last_error or RuntimeError("랭킹 데이터 다운로드 실패")
+
+def _ranking_cp_tier_label(cache, index):
+    for item in (cache.get("cpTiers") or []):
+        try:
+            if int(item.get("index") or 0) == int(index or 0):
+                return str(item.get("label") or "")
+        except Exception:
+            pass
+    return ""
+
+def _clean_ranking_boss(value):
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    text = re.sub(r"^\s*\d+\s*(?:네임드|보스)\s*(?:[·:：-]\s*)?", "", text, flags=re.I).strip()
+    return text or "—"
+
+def find_character_rankings(cache, info):
+    name = str(info.get("name") or "").strip().casefold()
+    job = str(info.get("job") or "").strip()
+    server_id = int(info.get("serverId") or 0)
+    if not name or not job:
+        return []
+
+    dungeon_map = {}
+    for order, d in enumerate(cache.get("dungeons") or []):
+        if isinstance(d, dict) and d.get("key") is not None:
+            dungeon_map[str(d.get("key"))] = (d, order)
+
+    metadata_map = {}
+    for meta in (cache.get("views") or []):
+        if not isinstance(meta, dict):
+            continue
+        key = f"{meta.get('dungeonKey')}|{int(meta.get('bossIndex') or 0)}|{int(meta.get('cpTierIndex') or 0)}|{meta.get('period')}"
+        metadata_map[key] = meta
+
+    results = []
+    class_rankings = cache.get("classRankings") or {}
+    if not isinstance(class_rankings, dict):
+        return []
+
+    for dungeon_key, ranking in class_rankings.items():
+        if not isinstance(ranking, dict):
+            continue
+        for view in (ranking.get("views") or []):
+            if not isinstance(view, dict):
+                continue
+            if str(view.get("period")) != "All":
+                continue
+            cp_tier_index = int(view.get("cpTierIndex") or 0)
+            boss_index = int(view.get("bossIndex") or 0)
+            if cp_tier_index <= 0 or boss_index != 0:
+                continue
+
+            group = None
+            for g in (view.get("rows") or []):
+                if isinstance(g, dict) and str(g.get("jobName") or "").strip() == job:
+                    group = g
+                    break
+            if not group:
+                continue
+
+            player = None
+            for candidate in (group.get("players") or []):
+                if not isinstance(candidate, dict):
+                    continue
+                cname = str(candidate.get("name") or "").strip()
+                if not cname or "*" in cname or cname.casefold() != name:
+                    continue
+                csid = int(candidate.get("serverId") or 0)
+                if server_id and csid and csid != server_id:
+                    continue
+                player = candidate
+                break
+            if not player:
+                continue
+
+            rank = int(player.get("rank") or 0)
+            if rank < 1 or rank > 20:
+                continue
+
+            meta_key = f"{dungeon_key}|{boss_index}|{cp_tier_index}|{view.get('period')}"
+            metadata = metadata_map.get(meta_key) or {}
+            dungeon_data, dungeon_order = dungeon_map.get(str(dungeon_key), ({}, 9999))
+            recorded_index = int(player.get("B") if player.get("B") is not None else (player.get("bossIndex") or 0))
+            boss_names = dungeon_data.get("bossNames") or []
+            if recorded_index > 0 and len(boss_names) >= recorded_index:
+                recorded_name = boss_names[recorded_index - 1]
+            else:
+                recorded_name = player.get("bossName") or ""
+            cp_label = str(metadata.get("cpTierLabel") or "") or _ranking_cp_tier_label(cache, cp_tier_index)
+            results.append({
+                "rank": rank,
+                "dps": int(player.get("dps") or 0),
+                "dungeonKey": str(dungeon_key),
+                "dungeonName": str(metadata.get("dungeonName") or dungeon_data.get("displayName") or dungeon_key),
+                "bossName": _clean_ranking_boss(recorded_name or metadata.get("bossName") or "—"),
+                "cpTierLabel": cp_label,
+                "dungeonOrder": dungeon_order,
+            })
+
+    best = {}
+    for row in results:
+        old = best.get(row["dungeonKey"])
+        if old is None or row["dps"] > old["dps"] or (row["dps"] == old["dps"] and row["rank"] < old["rank"]):
+            best[row["dungeonKey"]] = row
+    final = list(best.values())
+    final.sort(key=lambda x: (x["dungeonOrder"], -x["dps"]))
+    return final
+
+async def ranking_lookup_smart(body: str):
+    body = str(body or "").strip()
+    if not body:
+        return "사용법\n!랭킹 윤이지켈\n!랭킹 지켈윤이"
+
+    nickname, explicit_server = parse_character_query(body)
+    server_name = explicit_server
+
+    if not server_name:
+        parsed = split_server_and_nickname(body)
+        if parsed:
+            nickname, server_name = parsed
+        else:
+            nickname = body
+
+    resolved = await official_resolve_character(
+        nickname,
+        server_name,
+    )
+
+    if resolved["type"] == "none":
+        if server_name:
+            return f"⚠️ {server_name} 서버에서 '{nickname}' 캐릭터를 찾지 못했습니다."
+        return f"🔎 '{nickname}' 캐릭터를 찾지 못했습니다."
+
+    if resolved["type"] == "multiple":
+        lines = [
+            f"⚠️ '{nickname}' 캐릭터가 여러 서버에 있습니다.",
+            "",
+            "서버명을 붙여주세요.",
+        ]
+        for item in resolved["items"][:10]:
+            info = item["info"]
+            cp = (
+                round(int(info.get("combatPower") or 0) / 1000)
+                if info.get("combatPower")
+                else "-"
+            )
+            lines.append(
+                f"• {info.get('server') or '-'} · "
+                f"{info.get('job') or '-'} · {cp}"
+            )
+        return "\n".join(lines)
+
+    info = resolved["info"]
+
+    # Ranking dataset remains a NotMeter feature, but character identity/profile
+    # resolution is now official AION2 data.
+    cache = await fetch_ranking_cache()
+    rows = find_character_rankings(cache, info)
+
+    header = f"🏆 {info.get('name')} · {info.get('server')}"
+
+    if not rows:
+        return (
+            header +
+            "\n\nNotMeter 공개 TOP20 기록이 없습니다."
+        )
+
+    lines = [header]
+
+    for row in rows[:12]:
+        lines += [
+            "",
+            f"▶ {row['dungeonName']}",
+            f"#{row['rank']} · DPS {row['dps']:,}",
+        ]
+
+        if row.get("cpTierLabel"):
+            lines.append(
+                f"CP 구간 : {row['cpTierLabel']}"
+            )
+
+        if row.get("bossName") and row.get("bossName") != "—":
+            lines.append(
+                f"보스 : {row['bossName']}"
+            )
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# Field Boss
+# =========================================================
+
+# region index must match NotMeterFieldBossCatalog order.
+FIELD_BOSS_REGIONS = [
+    {
+        "key": "verteron",
+        "name": "베르테론",
+        "bosses": [
+            (2100040, "썩은 쿠타르"), (2100076, "광투사 쿠산"),
+            (2100003, "동쪽의 네이켈"), (2100050, "서쪽의 케르논"),
+            (2100077, "제사장 가르심"), (2100079, "호위병 티간트"),
+            (2100141, "만개한 코린"), (2100177, "분노한 사루스"),
+            (2100178, "피송곳니 프닌"), (2100582, "배교자 레일라"),
+            (2100617, "검은 촉수 라와"), (2100661, "환몽의 카시아"),
+            (2100708, "백부장 데미로스"), (2100718, "신성한 안사스"),
+            (2100876, "수확관리자 모샤브"), (2100877, "감시병기 크나쉬"),
+            (2100988, "학자 라울라"), (2100989, "숲전사 우라무"),
+            (2100991, "추격자 타울로"), (2101016, "연구관 세트람"),
+            (2101074, "영원의 가르투아"), (2101120, "침묵의 타르탄"),
+            (2101122, "영혼 지배자 카샤파"), (2101131, "군단장 라그타"),
+        ],
+    },
+    {
+        "key": "altgard",
+        "name": "알트가르드",
+        "bosses": [
+            (2400017, "녹아내린 다나르"), (2400074, "검은 전사 아에드"),
+            (2400140, "충실한 라지트"), (2400141, "광전사 발그"),
+            (2400212, "포식자 가르산"), (2400223, "혈전사 란나르"),
+            (2400274, "기만자 트리드"), (2400335, "푸른물결 켈피나"),
+            (2400353, "총감독관 누타"), (2400358, "참모관 르사나"),
+            (2400419, "별동대장 링크스"), (2400424, "모독자 노블루드"),
+            (2400425, "망혼의 아칸 악시오스"), (2400474, "중독된 하디룬"),
+            (2400504, "처형자 바르시엔"), (2400593, "드라칸 부대병기 구루타"),
+            (2400607, "백전노장 슈자칸"), (2400608, "비전의 카루카"),
+            (2400659, "흑암의 비슈베다"), (2400709, "예리한 쉬라크"),
+            (2400800, "불멸의 가르투아"), (2400853, "군단장 라그타"),
+            (2400854, "영혼 지배자 카샤파"), (2400855, "침묵의 타르탄"),
+        ],
+    },
+    {
+        "key": "eltnen",
+        "name": "엘테넨",
+        "bosses": [
+            (2101217, "응집된 베레놈"), (2101218, "옛 두목 비고르"),
+            (2101257, "꺾인 날개 츠바인"), (2101278, "탐욕의 이게티스"),
+            (2101279, "생명의 신수 수페르비아"), (2101306, "썩은 뿌리 멜트림"),
+            (2101349, "맹목적인 니호그"), (2101350, "최초의 실험체 크티마"),
+            (2101415, "세 개의 뿔 마이노"), (2101416, "고통의 람푸스"),
+            (2101600, "3부대장 카르코티"), (2101601, "부군단장 비바츠라"),
+        ],
+    },
+    {
+        "key": "morheim",
+        "name": "모르헤임",
+        "bosses": [
+            (2406034, "경계의 방랑자 파르곤"), (2406035, "포식의 거수 발라크"),
+            (2406071, "핏빛 눈보라 레눌프"), (2406093, "서리갑옷 하르칸"),
+            (2406094, "푸른 눈물 글레이시아"), (2406129, "업화의 날개 피오스"),
+            (2406131, "용암심장 바투"), (2406132, "정예 심문관 브란트"),
+            (2406181, "미쳐버린 파수꾼 불라간"), (2406182, "화산 군주 그림니르"),
+            (2406990, "3부대장 미나사라"), (2406991, "부군단장 사르바카"),
+        ],
+    },
+    {
+        "key": "abyss-lower",
+        "name": "어비스 하층",
+        "bosses": [
+            (2600068, "정령왕 아그로"), (2600089, "감시자 카이라"),
+            (2600084, "수호신장 나흐마"), (2600093, "수호신장 나흐마"),
+            (2600094, "수호신장 나흐마"), (2600096, "집행자 타마사"),
+            (2600097, "집행자 아그로"), (2600098, "집행자 카이라"),
+        ],
+    },
+    {
+        "key": "abyss-middle",
+        "name": "어비스 중층",
+        "bosses": [
+            (2600150, "분노한 수호신장 나흐마"), (2600156, "분노한 수호신장 나흐마"),
+            (2600520, "처형관 드라모스"), (2600521, "반역자 듀칼"),
+            (2600522, "파멸자 마라카"),
+        ],
+    },
+]
+
+BOSS_BY_CODE = {}
+for region_index, region in enumerate(FIELD_BOSS_REGIONS):
+    for code, name in region["bosses"]:
+        BOSS_BY_CODE[int(code)] = {
+            "name": name,
+            "region": region["name"],
+            "regionIndex": region_index,
+        }
+
+async def fetch_field_boss_cache():
+    cached = cache_get("field-boss-cache", FIELD_BOSS_CACHE_TTL)
+    if cached:
+        return cached
+
+    errors = []
+    for url in FIELD_BOSS_URLS:
+        try:
+            data = await http_json(url, params={"v": int(time.time() * 1000)})
+
+            if (
+                data.get("schema") != "notmeter-field-boss-public-cache-v1"
+                or int(data.get("version") or 0) != 1
+                or not isinstance(data.get("servers"), list)
+            ):
+                raise ValueError("invalid field-boss cache")
+
+            cache_set("field-boss-cache", data)
+            return data
+        except Exception as e:
+            errors.append(type(e).__name__)
+
+    raise RuntimeError("field boss cache unavailable: " + ",".join(errors))
+
+def zikel_boss_entries(cache):
+    server = next(
+        (
+            row for row in cache.get("servers", [])
+            if int(row.get("serverId") or 0) == SERVER_ID
+        ),
+        None,
+    )
+    if not server:
+        return []
+
+    rows = []
+    for region in server.get("regions") or []:
+        region_index = int(region.get("region") or 0)
+        fallback_region_name = (
+            FIELD_BOSS_REGIONS[region_index]["name"]
+            if 0 <= region_index < len(FIELD_BOSS_REGIONS)
+            else f"지역 {region_index}"
+        )
+
+        for entry in region.get("entries") or []:
+            code = int(entry.get("bossCode") or 0)
+            target_at = int(entry.get("targetAt") or 0)
+            if not code or not target_at:
+                continue
+
+            info = BOSS_BY_CODE.get(code) or {
+                "name": f"보스 {code}",
+                "region": fallback_region_name,
+            }
+
+            rows.append({
+                "bossCode": code,
+                "name": info["name"],
+                "region": info["region"],
+                "targetAt": target_at,
+            })
+
+    rows.sort(key=lambda x: x["targetAt"])
+    return rows
+
+def boss_time_parts(target_at):
+    target = datetime.fromtimestamp(target_at / 1000, tz=KST)
+    now = datetime.now(KST)
+    seconds = int((target - now).total_seconds())
+    clock = target.strftime("%H:%M")
+
+    if seconds <= 0:
+        ago = abs(seconds)
+        if ago < 60:
+            status = "시간 도달"
+        elif ago < 3600:
+            status = f"{ago // 60}분 지남"
+        else:
+            status = f"{ago // 3600}시간 {(ago % 3600) // 60}분 지남"
+        return clock, status
+
+    if seconds < 60:
+        status = f"{seconds}초 남음"
+    elif seconds < 3600:
+        status = f"{seconds // 60}분 남음"
+    else:
+        status = f"{seconds // 3600}시간 {(seconds % 3600) // 60}분 남음"
+
+    return clock, status
+
+def boss_time_text(target_at):
+    clock, status = boss_time_parts(target_at)
+    return f"{clock} · {status}"
+
+
+def format_all_field_bosses(cache):
+    rows = zikel_boss_entries(cache)
+    if not rows:
+        return "🐲 필드보스\n\n출현 시간 정보가 없습니다."
+
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["name"], []).append(row)
+
+    lines = ["🐲 필드보스", ""]
+
+    for name, items in grouped.items():
+        lines.append(name)
+        for row in items:
+            lines.append(f"⏰ {boss_time_text(row['targetAt'])}")
+        lines.append("")
+
+        if len("\n".join(lines)) > 900:
+            break
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    return "\n".join(lines)
+
+
+def normalize_boss_query(query):
+    return re.sub(r"\s+", "", str(query or "")).casefold()
+
+def format_one_boss(cache, query):
+    rows = zikel_boss_entries(cache)
+    q = normalize_boss_query(query)
+
+    aliases = {
+        "아그로": ("아그로", "정령왕 아그로"),
+        "나흐마": ("나흐마",),
+    }
+
+    names = aliases.get(q, (query,))
+    normalized_names = [normalize_boss_query(x) for x in names]
+
+    matches = []
+    for row in rows:
+        row_name = normalize_boss_query(row["name"])
+        if any(name in row_name for name in normalized_names):
+            matches.append(row)
+
+    if not matches:
+        return f"🐲 {query}\n\n출현 시간을 찾지 못했습니다."
+
+    display_name = matches[0]["name"]
+    lines = [f"🐲 {display_name}", ""]
+
+    seen = set()
+    for row in matches:
+        target = datetime.fromtimestamp(row["targetAt"] / 1000, tz=KST)
+        clock = target.strftime("%H:%M")
+        if clock in seen:
+            continue
+        seen.add(clock)
+        lines.append(f"⏰ {clock}")
+
+    return "\n".join(lines)
+
+
+
+# =========================================================
+# AUTO boss schedule engine
+# - Core boss commands do NOT depend on NotMeter boss cache.
+# - Every 5 minutes the server re-reads recent official Notice/Update rows.
+# - If a recognizable schedule change is found, that rule immediately becomes
+#   the source for !필보 / individual boss lookup / 30-minute alerts.
+# - If wording is ambiguous, the last confirmed/default rule is preserved.
+# =========================================================
+
+DEFAULT_BOSS_RULES = {
+    "kairaHours": [1, 5, 9, 13, 17, 21],
+    "nahmaWeekdays": [4, 6],     # Fri / Sun, Monday=0
+    "nahmaHour": 22,
+    "nahmaMinute": 0,
+    "abyssWeekdays": [2, 5],     # Wed / Sat
+    "abyssHour": 22,
+    "abyssMinute": 30,
+    "agroIntervalHours": 12,
+}
+
+BOSS_RULES = dict(DEFAULT_BOSS_RULES)
+BOSS_RULES_META = {
+    "updatedAt": None,
+    "sources": {},
+}
+
+AGRO_FALLBACK_ANCHOR = datetime(2026, 9, 2, 7, 0, tzinfo=KST)
+
+_boss_rule_refresh = {
+    "ts": 0.0,
+    "lock": asyncio.Lock(),
+}
+
+_maintenance_anchor_cache = {
+    "value": None,
+    "ts": 0.0,
+}
+
+_WEEKDAY_KO = {
+    "월": 0, "월요일": 0,
+    "화": 1, "화요일": 1,
+    "수": 2, "수요일": 2,
+    "목": 3, "목요일": 3,
+    "금": 4, "금요일": 4,
+    "토": 5, "토요일": 5,
+    "일": 6, "일요일": 6,
+}
+
+def _next_daily_hours(hours, now=None):
+    now = now or datetime.now(KST)
+    hours = sorted(set(int(x) for x in hours))
+    for hour in hours:
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target > now:
+            return target
+    tomorrow = now + timedelta(days=1)
+    return tomorrow.replace(
+        hour=int(hours[0]),
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+def _next_weekly(weekdays, hour, minute=0, now=None):
+    now = now or datetime.now(KST)
+    best = None
+    weekdays = tuple(int(x) for x in weekdays)
+
+    for add_days in range(0, 8):
+        day = now + timedelta(days=add_days)
+        if day.weekday() not in weekdays:
+            continue
+
+        target = day.replace(
+            hour=int(hour),
+            minute=int(minute),
+            second=0,
+            microsecond=0,
+        )
+        if target <= now:
+            continue
+        if best is None or target < best:
+            best = target
+
+    if best is not None:
+        return best
+
+    return (now + timedelta(days=7)).replace(
+        hour=int(hour),
+        minute=int(minute),
+        second=0,
+        microsecond=0,
+    )
+
+def _extract_clock_values(text_value):
+    """
+    Return unique clock times as (hour, minute).
+    Supports 01:00 / 1시 / 1시 30분.
+    """
+    source = str(text_value or "")
+    found = []
+
+    for h, m in re.findall(r"(?<!\d)([01]?\d|2[0-3])\s*:\s*([0-5]\d)", source):
+        item = (int(h), int(m))
+        if item not in found:
+            found.append(item)
+
+    for h, m in re.findall(r"(?<!\d)([01]?\d|2[0-3])\s*시(?:\s*([0-5]?\d)\s*분)?", source):
+        item = (int(h), int(m or 0))
+        if item not in found:
+            found.append(item)
+
+    return found
+
+def _extract_weekdays(text_value):
+    source = str(text_value or "")
+    result = []
+
+    # Prefer explicit "...요일" tokens.
+    for token in re.findall(r"(월요일|화요일|수요일|목요일|금요일|토요일|일요일)", source):
+        value = _WEEKDAY_KO.get(token)
+        if value is not None and value not in result:
+            result.append(value)
+
+    # Also understand compact forms such as 수/토, 금·일.
+    if not result:
+        for token in re.findall(r"(?<![가-힣])(월|화|수|목|금|토|일)(?![가-힣])", source):
+            value = _WEEKDAY_KO.get(token)
+            if value is not None and value not in result:
+                result.append(value)
+
+    return result
+
+def _parse_maintenance_end_from_notice(row):
+    title = str((row or {}).get("title") or "")
+    raw = str((row or {}).get("rawText") or "")
+    source = title + "\n" + raw
+    posted = str((row or {}).get("date") or "")
+
+    m = re.search(
+        r"(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})"
+        r".{0,80}?"
+        r"(?P<sh>\d{1,2})\s*:\s*(?P<sm>\d{2})"
+        r"\s*(?:~|∼|～|-)\s*"
+        r"(?P<eh>\d{1,2})\s*:\s*(?P<em>\d{2})",
+        source,
+        re.S,
+    )
+    if not m:
+        return None
+
+    year = datetime.now(KST).year
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", posted):
+        try:
+            year = int(posted[:4])
+        except Exception:
+            pass
+
+    try:
+        month = int(m.group("month"))
+        day = int(m.group("day"))
+        start_hour = int(m.group("sh"))
+        start_minute = int(m.group("sm"))
+        end_hour = int(m.group("eh"))
+        end_minute = int(m.group("em"))
+
+        start = datetime(year, month, day, start_hour, start_minute, tzinfo=KST)
+        end = datetime(year, month, day, end_hour, end_minute, tzinfo=KST)
+
+        if end <= start:
+            end += timedelta(days=1)
+
+        return end
+    except Exception:
+        return None
+
+async def latest_maintenance_anchor():
+    now_ts = time.time()
+    cached = _maintenance_anchor_cache.get("value")
+    cached_ts = float(_maintenance_anchor_cache.get("ts") or 0)
+
+    if cached is not None and now_ts - cached_ts < 300:
+        return cached
+
+    anchor = None
+    source_title = None
+
+    try:
+        rows = await fetch_board_latest("공지", limit=18)
+        for row in rows:
+            if "점검" not in str(row.get("title") or ""):
+                continue
+            parsed = _parse_maintenance_end_from_notice(row)
+            if parsed is not None:
+                anchor = parsed
+                source_title = row.get("title")
+                break
+    except Exception:
+        anchor = None
+
+    if anchor is None:
+        anchor = AGRO_FALLBACK_ANCHOR
+
+    _maintenance_anchor_cache["value"] = anchor
+    _maintenance_anchor_cache["ts"] = now_ts
+
+    if source_title:
+        BOSS_RULES_META["sources"]["maintenance"] = str(source_title)
+
+    return anchor
+
+def _apply_kaira_rule(source, source_title):
+    """
+    Accepts either explicit multiple times or a phrase containing a 4-hour cycle
+    plus a clear first hour. It only updates when confidence is high.
+    """
+    if "카이라" not in source:
+        return False
+
+    clocks = _extract_clock_values(source)
+    zero_minute_hours = sorted(set(h for h, m in clocks if m == 0))
+
+    # Strongest case: six explicit 4-hourly hours.
+    if len(zero_minute_hours) >= 6:
+        for start in range(0, 4):
+            expected = sorted(((start + 4 * i) % 24) for i in range(6))
+            if all(h in zero_minute_hours for h in expected):
+                BOSS_RULES["kairaHours"] = expected
+                BOSS_RULES_META["sources"]["kaira"] = source_title
+                return True
+
+    # Wording like "01시부터 4시간마다".
+    m = re.search(
+        r"(?<!\d)([01]?\d|2[0-3])\s*(?:시|:00).{0,50}?(?:4\s*시간|4시간).{0,20}?(?:마다|간격|주기)",
+        source,
+        re.S,
+    )
+    if not m:
+        m = re.search(
+            r"(?:4\s*시간|4시간).{0,40}?(?:마다|간격|주기).{0,50}?(?<!\d)([01]?\d|2[0-3])\s*(?:시|:00)",
+            source,
+            re.S,
+        )
+
+    if m:
+        start_hour = int(m.group(1))
+        hours = sorted(((start_hour + 4 * i) % 24) for i in range(6))
+        BOSS_RULES["kairaHours"] = hours
+        BOSS_RULES_META["sources"]["kaira"] = source_title
+        return True
+
+    return False
+
+def _apply_named_weekly_rule(source, source_title, keyword, weekday_key, hour_key, minute_key):
+    if keyword not in source:
+        return False
+
+    weekdays = _extract_weekdays(source)
+    clocks = _extract_clock_values(source)
+
+    if not weekdays or not clocks:
+        return False
+
+    # Choose the first explicit time in a compact snippet around the boss name.
+    boss_pos = source.find(keyword)
+    local = source[max(0, boss_pos - 100): boss_pos + 500]
+    local_clocks = _extract_clock_values(local)
+    if local_clocks:
+        hour, minute = local_clocks[0]
+    else:
+        hour, minute = clocks[0]
+
+    BOSS_RULES[weekday_key] = sorted(set(weekdays))
+    BOSS_RULES[hour_key] = int(hour)
+    BOSS_RULES[minute_key] = int(minute)
+    BOSS_RULES_META["sources"][keyword] = source_title
+    return True
+
+def _apply_agro_interval_rule(source, source_title):
+    if "아그로" not in source:
+        return False
+
+    m = re.search(r"아그로.{0,120}?(\d{1,2})\s*시간(?:마다|간격|주기)?", source, re.S)
+    if not m:
+        m = re.search(r"(\d{1,2})\s*시간(?:마다|간격|주기)?.{0,120}?아그로", source, re.S)
+
+    if not m:
+        return False
+
+    interval = int(m.group(1))
+    if interval < 1 or interval > 48:
+        return False
+
+    BOSS_RULES["agroIntervalHours"] = interval
+    BOSS_RULES_META["sources"]["agro"] = source_title
+    return True
+
+async def refresh_boss_rules(force=False):
+    """
+    Re-scan official Notice + Update every 5 minutes.
+    Newer rows win because board APIs return newest first.
+    """
+    now_ts = time.time()
+    if not force and now_ts - float(_boss_rule_refresh.get("ts") or 0) < 300:
+        return BOSS_RULES
+
+    async with _boss_rule_refresh["lock"]:
+        now_ts = time.time()
+        if not force and now_ts - float(_boss_rule_refresh.get("ts") or 0) < 300:
+            return BOSS_RULES
+
+        # Start from the current rule set, not defaults, so an ambiguous post
+        # never wipes a previously confirmed schedule.
+        try:
+            rows = []
+            for board_name in ("공지", "업데이트"):
+                try:
+                    rows.extend(await fetch_board_latest(board_name, limit=18))
+                except Exception:
+                    pass
+
+            # Sort by date descending when available; original order is already
+            # newest-first within each board.
+            seen_sources = set()
+            for row in rows:
+                source_title = str(row.get("title") or "")
+                source = (
+                    source_title + "\n" +
+                    str(row.get("rawText") or "")
+                )
+
+                if not source_title or source_title in seen_sources:
+                    continue
+                seen_sources.add(source_title)
+
+                _apply_kaira_rule(source, source_title)
+                _apply_agro_interval_rule(source, source_title)
+                _apply_named_weekly_rule(
+                    source, source_title,
+                    "나흐마",
+                    "nahmaWeekdays", "nahmaHour", "nahmaMinute",
+                )
+                _apply_named_weekly_rule(
+                    source, source_title,
+                    "어비스",
+                    "abyssWeekdays", "abyssHour", "abyssMinute",
+                )
+
+            BOSS_RULES_META["updatedAt"] = datetime.now(KST).isoformat()
+        finally:
+            _boss_rule_refresh["ts"] = time.time()
+
+    return BOSS_RULES
+
+def next_agro_from_anchor(anchor, now=None):
+    now = now or datetime.now(KST)
+    interval = timedelta(hours=int(BOSS_RULES["agroIntervalHours"]))
+
+    if now < anchor:
+        return anchor
+
+    elapsed = now - anchor
+    steps = int(elapsed.total_seconds() // interval.total_seconds()) + 1
+    return anchor + (interval * steps)
+
+def agro_targets(anchor, count=4, now=None):
+    first = next_agro_from_anchor(anchor, now=now)
+    interval = timedelta(hours=int(BOSS_RULES["agroIntervalHours"]))
+    return [first + (interval * i) for i in range(count)]
+
+def format_kaira_schedule():
+    hours = list(BOSS_RULES["kairaHours"])
+    lines = ["🐲 감시자 카이라", ""]
+    for hour in hours:
+        lines.append(f"⏰ {int(hour):02d}:00")
+    return "\n".join(lines)
+
+def format_nahma_schedule():
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    days = "/".join(weekday_names[int(x)] for x in BOSS_RULES["nahmaWeekdays"])
+    return "\n".join([
+        "🐲 수호신장 나흐마",
+        "",
+        f"⏰ {days} {int(BOSS_RULES['nahmaHour']):02d}:{int(BOSS_RULES['nahmaMinute']):02d}",
+    ])
+
+def format_abyss_schedule():
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    days = "/".join(weekday_names[int(x)] for x in BOSS_RULES["abyssWeekdays"])
+    return "\n".join([
+        "🐲 어비스 보스",
+        "",
+        f"⏰ {days} {int(BOSS_RULES['abyssHour']):02d}:{int(BOSS_RULES['abyssMinute']):02d}",
+    ])
+
+def _date_clock(dt):
+    return f"{dt.month}/{dt.day} {dt.strftime('%H:%M')}"
+
+async def format_agro_schedule():
+    await refresh_boss_rules()
+    anchor = await latest_maintenance_anchor()
+    targets = agro_targets(anchor, count=4)
+
+    lines = ["🐲 정령왕 아그로", ""]
+    for target in targets:
+        lines.append(f"⏰ {_date_clock(target)}")
+
+    lines += [
+        "",
+        f"기준 : 최근 점검 종료 {_date_clock(anchor)}",
+        f"주기 : {int(BOSS_RULES['agroIntervalHours'])}시간",
+    ]
+    return "\n".join(lines)
+
+async def format_all_core_bosses():
+    await refresh_boss_rules()
+
+    now = datetime.now(KST)
+    anchor = await latest_maintenance_anchor()
+
+    agro = next_agro_from_anchor(anchor, now)
+    kaira = _next_daily_hours(BOSS_RULES["kairaHours"], now)
+    nahma = _next_weekly(
+        BOSS_RULES["nahmaWeekdays"],
+        BOSS_RULES["nahmaHour"],
+        BOSS_RULES["nahmaMinute"],
+        now,
+    )
+    abyss = _next_weekly(
+        BOSS_RULES["abyssWeekdays"],
+        BOSS_RULES["abyssHour"],
+        BOSS_RULES["abyssMinute"],
+        now,
+    )
+
+    rows = [
+        ("정령왕 아그로", agro),
+        ("감시자 카이라", kaira),
+        ("수호신장 나흐마", nahma),
+        ("어비스 보스", abyss),
+    ]
+    rows.sort(key=lambda x: x[1])
+
+    lines = ["🐲 필드보스", ""]
+    for name, target in rows:
+        lines.append(name)
+        lines.append(f"⏰ {_date_clock(target)}")
+        lines.append("")
+
+    lines.append(f"아그로 기준 점검 종료 : {_date_clock(anchor)}")
+    return "\n".join(lines)
+
+async def field_boss_lookup(query=None):
+    await refresh_boss_rules()
+
+    q = normalize_boss_query(query)
+
+    if not q:
+        return await format_all_core_bosses()
+
+    if q in ("카이라", "감시자카이라"):
+        return format_kaira_schedule()
+
+    if q in ("나흐마", "수호신장나흐마", "분노한수호신장나흐마"):
+        return format_nahma_schedule()
+
+    if q in ("어비스", "어비스보스"):
+        return format_abyss_schedule()
+
+    if q in ("아그로", "정령왕아그로", "집행자아그로"):
+        return await format_agro_schedule()
+
+    try:
+        cache = await fetch_field_boss_cache()
+        return format_one_boss(cache, query)
+    except Exception:
+        return f"🐲 {query}\n\n현재 자동 일정이 등록되지 않은 보스입니다."
+
+
+# =========================================================
+# Official AION2 boards
+# =========================================================
+
+COMMUNITY_API = "https://api-community.plaync.com/aion2/board"
+
+BOARD_CONFIGS = {
+    "공지": {
+        "alias": "notice_ko",
+        "label": "공지",
+        "view": "notice",
+    },
+    "CM": {
+        "alias": "cm_story_ko",
+        "label": "CM",
+        "view": "cm_story",
+    },
+    "업데이트": {
+        "alias": "update_ko",
+        "label": "업데이트",
+        "view": "update",
+    },
+}
+
+async def fetch_board_latest(command: str, limit: int = 5):
+    config = BOARD_CONFIGS[command]
+    alias = config["alias"]
+
+    url = f"{COMMUNITY_API}/{alias}/article/search/moreArticle"
+
+    client = await get_http_client()
+    response = await client.get(
+        url,
+        params={
+            "isVote": "true",
+            "moreSize": "18",
+            "moreDirection": "BEFORE",
+            "previousArticleId": "0",
+        },
+        headers=PLAYNC_HEADERS,
+        timeout=httpx.Timeout(connect=3.0, read=10.0, write=3.0, pool=2.0),
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    # PlayNC payload has normally been {"contentList":[...]}, but tolerate wrappers.
+    content_list = []
+    if isinstance(data, dict):
+        if isinstance(data.get("contentList"), list):
+            content_list = data.get("contentList") or []
+        elif isinstance(data.get("result"), dict) and isinstance(data["result"].get("contentList"), list):
+            content_list = data["result"].get("contentList") or []
+        elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("contentList"), list):
+            content_list = data["data"].get("contentList") or []
+
+    rows = []
+    for item in content_list:
+        if not isinstance(item, dict):
+            continue
+
+        snow = item.get("snow") or {}
+        content_id = snow.get("contentId") or item.get("contentId") or item.get("articleId")
+        title = str(item.get("title") or "").strip()
+        timestamps = item.get("timestamps") or {}
+        posted = timestamps.get("postDateTime") or item.get("postDateTime") or ""
+
+        if not content_id or not title:
+            continue
+
+        date_text = str(posted)[:10] if posted else ""
+        link = (
+            f"https://aion2.plaync.com/ko-kr/board/"
+            f"{config['view']}/view?articleId={content_id}"
+        )
+
+        rows.append({
+            "id": str(content_id),
+            "title": title,
+            "date": date_text,
+            "link": link,
+            "rawText": json.dumps(item, ensure_ascii=False),
+        })
+
+        if len(rows) >= limit:
+            break
+
+    return rows
+
+def format_board_latest(command: str, rows):
+    if command == "공지":
+        rows = [
+            r for r in rows
+            if "점검" in str(r.get("title") or "")
+        ]
+        if not rows:
+            return "🔧 AION2 점검 공지\n\n현재 확인되는 점검 공지가 없습니다."
+
+        row = rows[0]
+        return "\n".join([
+            "🔧 AION2 점검 공지",
+            "",
+            row["title"],
+            "",
+            "🔗 공식 공지",
+            row["link"],
+        ])
+
+    if command == "CM":
+        if not rows:
+            return "📢 AION2 CM\n\n최신 CM 글이 없습니다."
+        row = rows[0]
+        return "\n".join([
+            "📢 AION2 CM",
+            "",
+            row["title"],
+            "",
+            "🔗 바로 보기",
+            row["link"],
+        ])
+
+    if command == "업데이트":
+        if not rows:
+            return "🆕 AION2 업데이트\n\n최신 업데이트가 없습니다."
+        row = rows[0]
+        return "\n".join([
+            "🆕 AION2 업데이트",
+            "",
+            row["title"],
+            "",
+            "🔗 바로 보기",
+            row["link"],
+        ])
+
+    return ""
+
+
+async def board_lookup(command: str):
+    cache_key = f"board:{command}"
+    cached = cache_get(cache_key, 300)
+    if cached:
+        return cached
+
+    rows = await fetch_board_latest(command, limit=18 if command == "공지" else 5)
+    result = format_board_latest(command, rows)
+    cache_set(cache_key, result)
+    return result
+
+
+# =========================================================
+# New-post alerts
+# =========================================================
+
+# Filled later in Render Environment.
+KAKAO_BOT_ID = os.getenv("KAKAO_BOT_ID", "").strip()
+KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "").strip()
+KAKAO_EVENT_NAME = os.getenv("KAKAO_EVENT_NAME", "aion2_new_post").strip()
+ALERT_CRON_SECRET = os.getenv("ALERT_CRON_SECRET", "").strip()
+
+# Optional permanent recipients:
+# ALERT_BOT_USER_KEYS=key1,key2,key3
+ENV_ALERT_USER_KEYS = [
+    x.strip()
+    for x in os.getenv("ALERT_BOT_USER_KEYS", "").split(",")
+    if x.strip()
+]
+
+# State is kept on the web service. The 1-minute cron ping keeps a free web
+# service awake. On a redeploy/restart the first check becomes a fresh baseline
+# and sends ZERO old posts.
+ALERT_STATE_FILE = Path(os.getenv("ALERT_STATE_FILE", "/tmp/aion2_alert_state.json"))
+
+NOTICE_ALERT_KEYWORDS = ("점검",)
+
+_alert_check_lock = asyncio.Lock()
+
+def _default_alert_state():
+    return {
+        "initialized": False,
+        "lastSeen": {"공지": None, "CM": None, "업데이트": None},
+        "runtimeSubscribers": {},
+        "sent": [],
+    }
+
+def _load_alert_state():
+    try:
+        if not ALERT_STATE_FILE.exists():
+            return _default_alert_state()
+        raw = json.loads(ALERT_STATE_FILE.read_text(encoding="utf-8"))
+        state = _default_alert_state()
+        state["initialized"] = bool(raw.get("initialized", False))
+        if isinstance(raw.get("lastSeen"), dict):
+            state["lastSeen"].update(raw["lastSeen"])
+        if isinstance(raw.get("runtimeSubscribers"), dict):
+            state["runtimeSubscribers"] = raw["runtimeSubscribers"]
+        if isinstance(raw.get("sent"), list):
+            state["sent"] = raw["sent"][-500:]
+        return state
+    except Exception:
+        return _default_alert_state()
+
+def _save_alert_state(state):
+    try:
+        ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ALERT_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(ALERT_STATE_FILE)
+        return True
+    except Exception:
+        return False
+
+def _extract_user_key(payload):
+    user = ((payload.get("userRequest") or {}).get("user") or {})
+    props = user.get("properties") or {}
+
+    key = str(props.get("botUserKey") or "").strip()
+    if key:
+        return "botUserKey", key
+
+    key = str(props.get("plusfriendUserKey") or "").strip()
+    if key:
+        return "plusfriendUserKey", key
+
+    # Kakao skill payload generally exposes the bot user key as user.id.
+    key = str(user.get("id") or "").strip()
+    if key:
+        return "botUserKey", key
+
+    return None, None
+
+def _register_alert_user(payload):
+    user_type, user_id = _extract_user_key(payload)
+    if not user_id:
+        return False, "알림 등록용 사용자 키를 확인하지 못했습니다."
+
+    state = _load_alert_state()
+    state["runtimeSubscribers"][user_id] = {
+        "type": user_type,
+        "registeredAt": int(time.time()),
+    }
+    _save_alert_state(state)
+    return True, (
+        "🔔 새글 알림 등록 완료\n"
+        "공지 : 새 점검 공지만\n"
+        "CM : 새 글 전체\n"
+        "업데이트 : 새 글 전체"
+    )
+
+def _unregister_alert_user(payload):
+    _user_type, user_id = _extract_user_key(payload)
+    if not user_id:
+        return False, "알림 해제용 사용자 키를 확인하지 못했습니다."
+
+    state = _load_alert_state()
+    state["runtimeSubscribers"].pop(user_id, None)
+    _save_alert_state(state)
+    return True, "🔕 새글 알림을 해제했습니다."
+
+def _alert_recipients(state):
+    recipients = {}
+
+    # Environment recipients survive web redeploys.
+    for key in ENV_ALERT_USER_KEYS:
+        recipients[key] = {"type": "botUserKey", "id": key}
+
+    # Runtime registration is convenient while testing.
+    for key, info in state.get("runtimeSubscribers", {}).items():
+        recipients[key] = {
+            "type": str(info.get("type") or "botUserKey"),
+            "id": key,
+        }
+
+    return list(recipients.values())
+
+def _should_alert(board_name, post):
+    if board_name == "공지":
+        title = str(post.get("title") or "")
+        return any(keyword in title for keyword in NOTICE_ALERT_KEYWORDS)
+    return board_name in ("CM", "업데이트")
+
+async def _send_kakao_event(recipients, board_name, post):
+    if not recipients:
+        return {"status": "NO_RECIPIENTS"}
+
+    if not KAKAO_BOT_ID or not KAKAO_REST_API_KEY:
+        return {
+            "status": "NOT_CONFIGURED",
+            "message": "KAKAO_BOT_ID / KAKAO_REST_API_KEY missing",
+        }
+
+    url = f"https://bot-api.kakao.com/v2/bots/{KAKAO_BOT_ID}/talk"
+    headers = {
+        "Authorization": f"KakaoAK {KAKAO_REST_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    results = []
+    for start in range(0, len(recipients), 100):
+        users = recipients[start:start + 100]
+        body = {
+            "event": {
+                "name": KAKAO_EVENT_NAME,
+                "data": {
+                    "board": str(board_name),
+                    "title": str(post.get("title") or ""),
+                    "date": str(post.get("date") or ""),
+                    "url": str(post.get("link") or ""),
+                },
+            },
+            "user": users,
+        }
+
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            response = await client.post(url, headers=headers, json=body)
+
+        try:
+            response_json = response.json()
+        except Exception:
+            response_json = {"raw": response.text[:500]}
+
+        results.append({
+            "httpStatus": response.status_code,
+            "response": response_json,
+        })
+
+    return {"status": "REQUESTED", "results": results}
+
+async def _initialize_alert_baseline(state=None):
+    """
+    Safety rule:
+    The first monitoring check stores the current latest IDs and sends NOTHING.
+    Therefore old posts never fire merely because monitoring was enabled.
+    """
+    if state is None:
+        state = _load_alert_state()
+
+    for board_name in ("공지", "CM", "업데이트"):
+        rows = await fetch_board_latest(board_name, limit=18)
+        state["lastSeen"][board_name] = rows[0]["id"] if rows else None
+
+    state["initialized"] = True
+    _save_alert_state(state)
+    return state
+
+async def check_new_posts_and_alert():
+    async with _alert_check_lock:
+        state = _load_alert_state()
+
+        if not state.get("initialized"):
+            await _initialize_alert_baseline(state)
+            return {
+                "ok": True,
+                "baseline": True,
+                "alerts": 0,
+                "message": "현재 최신 글을 기준점으로 저장했습니다. 과거 글은 발송하지 않았습니다.",
+            }
+
+        recipients = _alert_recipients(state)
+        sent_keys = set(str(x) for x in state.get("sent", []))
+        summary = []
+        alert_count = 0
+
+        for board_name in ("공지", "CM", "업데이트"):
+            rows = await fetch_board_latest(board_name, limit=18)
+            if not rows:
+                continue
+
+            previous_id = state["lastSeen"].get(board_name)
+
+            # API is time-descending. Collect only rows that appeared before
+            # the previous marker, then send oldest->newest.
+            new_rows = []
+            for row in rows:
+                if previous_id is not None and int(row["id"]) == int(previous_id):
+                    break
+                new_rows.append(row)
+
+            # Always advance marker to current latest, even if notice filters out.
+            state["lastSeen"][board_name] = rows[0]["id"]
+
+            for post in reversed(new_rows):
+                sent_key = f"{board_name}:{post['id']}"
+                if sent_key in sent_keys:
+                    continue
+                if not _should_alert(board_name, post):
+                    continue
+
+                send_result = await _send_kakao_event(
+                    recipients,
+                    board_name,
+                    post,
+                )
+
+                summary.append({
+                    "board": board_name,
+                    "id": post["id"],
+                    "title": post["title"],
+                    "send": send_result,
+                })
+
+                # Mark only after the send request has been made. This prevents
+                # duplicate requests on the next minute.
+                if send_result.get("status") in ("REQUESTED", "NO_RECIPIENTS", "NOT_CONFIGURED"):
+                    sent_keys.add(sent_key)
+                    alert_count += 1
+
+        state["sent"] = list(sent_keys)[-500:]
+        _save_alert_state(state)
+
+        return {
+            "ok": True,
+            "baseline": False,
+            "alerts": alert_count,
+            "recipients": len(recipients),
+            "items": summary,
+        }
+
+# =========================================================
+# Routes
+# =========================================================
+
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "service": "AION2 Server v23 FullServerFix",
+        "server": "전 서버 캐릭터 검색 / 지켈 필드보스",
+        "character": "AION2 official character room",
+        "fieldBoss": "NotMeter public cache",
+        "officialBoards": ["공지", "CM", "업데이트"],
+    }
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.get("/debug/character-server/{server_name}/{nickname}")
+async def debug_character_server(server_name: str, nickname: str):
+    try:
+        result = await asyncio.wait_for(
+            character_lookup_server_fast(nickname, server_name),
+            timeout=7.0,
+        )
+        return {
+            "ok": bool(result),
+            "server": server_name,
+            "nickname": nickname,
+            "knownServerId": SERVER_ID_CACHE.get(server_name),
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "server": server_name,
+            "nickname": nickname,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+@app.get("/debug/server-parse/{text}")
+async def debug_server_parse(text: str):
+    parsed = split_server_and_nickname(text)
+
+    if not parsed:
+        return {
+            "ok": False,
+            "input": text,
+            "parsed": None,
+        }
+
+    nickname, server_name = parsed
+
+    return {
+        "ok": True,
+        "input": text,
+        "nickname": nickname,
+        "server": server_name,
+        "serverId": SERVER_ID_MAP.get(server_name),
+    }
+
+
+@app.get("/debug/server-character/{server_name}/{nickname}")
+async def debug_server_character(server_name: str, nickname: str):
+    try:
+        rows = await search_character_on_server(
+            nickname,
+            server_name,
+        )
+
+        return {
+            "ok": bool(rows),
+            "server": server_name,
+            "serverId": SERVER_ID_MAP.get(server_name),
+            "nickname": nickname,
+            "count": len(rows),
+            "rows": [
+                {
+                    "name": row_name(row),
+                    "serverName": row_server_name(row),
+                    "serverId": row_server_id(row),
+                    "characterId": row_character_id(row),
+                    "combatPower": row.get("combatPower"),
+                    "className": row.get("className"),
+                }
+                for row in rows[:10]
+            ],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "server": server_name,
+            "nickname": nickname,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+
+@app.get("/debug/zikel/{nickname}")
+async def debug_zikel_character(nickname: str):
+    try:
+        result = await asyncio.wait_for(
+            character_lookup_server_fast(nickname, "지켈"),
+            timeout=6.5,
+        )
+        return {
+            "ok": bool(result),
+            "result": result,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+@app.get("/debug/character/{nickname}")
+async def debug_character(nickname: str):
+    try:
+        result = await asyncio.wait_for(character_lookup(nickname), timeout=4.35)
+        return {"ok": bool(result), "result": result}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+@app.get("/debug/field-boss")
+async def debug_field_boss():
+    try:
+        result = await asyncio.wait_for(field_boss_lookup(), timeout=4.35)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+@app.get("/debug/field-boss/{boss_name}")
+async def debug_one_field_boss(boss_name: str):
+    try:
+        result = await asyncio.wait_for(
+            field_boss_lookup(boss_name),
+            timeout=4.35,
+        )
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+
+@app.get("/debug/board/{board_name}")
+async def debug_board(board_name: str):
+    key = "CM" if board_name.lower() == "cm" else board_name
+    if key not in BOARD_CONFIGS:
+        return {
+            "ok": False,
+            "error": "UnknownBoard",
+            "message": "공지 / CM / 업데이트 중 하나를 입력하세요.",
+        }
+    try:
+        result = await asyncio.wait_for(board_lookup(key), timeout=4.35)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:300],
+        }
+
+
+@app.get("/alerts/status")
+async def alerts_status():
+    state = _load_alert_state()
+    return {
+        "ok": True,
+        "initialized": state.get("initialized", False),
+        "lastSeen": state.get("lastSeen", {}),
+        "runtimeSubscribers": len(state.get("runtimeSubscribers", {})),
+        "envSubscribers": len(ENV_ALERT_USER_KEYS),
+        "kakaoConfigured": bool(KAKAO_BOT_ID and KAKAO_REST_API_KEY and KAKAO_EVENT_NAME),
+    }
+
+@app.get("/alerts/check")
+async def alerts_check(secret: str = ""):
+    if ALERT_CRON_SECRET and secret != ALERT_CRON_SECRET:
+        return JSONResponse(
+            {"ok": False, "error": "Unauthorized"},
+            status_code=401,
+        )
+    try:
+        result = await asyncio.wait_for(
+            check_new_posts_and_alert(),
+            timeout=20,
+        )
+        return result
+    except Exception as e:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": type(e).__name__,
+                "message": str(e)[:500],
+            },
+            status_code=500,
+        )
+
+
+
+
+# =========================================================
+# Pretty OpenChat article cards + MessengerBotR alerts
+# =========================================================
+
+OPENCHAT_ALERT_STATE_FILE = Path(
+    os.getenv("OPENCHAT_ALERT_STATE_FILE", "/tmp/aion2_openchat_alert_state.json")
+)
+_openchat_alert_lock = asyncio.Lock()
+
+def _default_openchat_alert_state():
+    return {
+        "initialized": False,
+        "lastSeen": {"공지": None, "CM": None, "업데이트": None},
+        "bossSent": [],
+    }
+
+def _load_openchat_alert_state():
+    try:
+        if not OPENCHAT_ALERT_STATE_FILE.exists():
+            return _default_openchat_alert_state()
+        raw = json.loads(OPENCHAT_ALERT_STATE_FILE.read_text(encoding="utf-8"))
+        state = _default_openchat_alert_state()
+        state["initialized"] = bool(raw.get("initialized", False))
+        if isinstance(raw.get("lastSeen"), dict):
+            state["lastSeen"].update(raw["lastSeen"])
+        if isinstance(raw.get("bossSent"), list):
+            state["bossSent"] = [str(x) for x in raw["bossSent"]]
+        return state
+    except Exception:
+        return _default_openchat_alert_state()
+
+def _save_openchat_alert_state(state):
+    try:
+        OPENCHAT_ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OPENCHAT_ALERT_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+def board_card_url(board_name, post_id):
+    return (
+        "https://aion2-kakao-bot.onrender.com/p/"
+        + quote(str(board_name), safe="")
+        + "/"
+        + quote(str(post_id), safe="")
+    )
+
+def board_card_label(board_name):
+    if board_name == "공지":
+        return "🔧 AION2 점검 공지"
+    if board_name == "CM":
+        return "📢 AION2 CM"
+    return "🆕 AION2 업데이트"
+
+async def _official_page_og_image(url: str):
+    cache_key = "ogimg:" + url
+    cached = cache_get(cache_key, 3600)
+    if cached is not None:
+        return cached
+
+    try:
+        client = await get_http_client()
+        res = await client.get(
+            url,
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=httpx.Timeout(connect=1.0, read=3.0, write=1.0, pool=1.0),
+        )
+        text = res.text
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        ]
+        image = ""
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.I)
+            if m:
+                image = m.group(1).strip()
+                break
+
+        cache_set(cache_key, image)
+        return image
+    except Exception:
+        cache_set(cache_key, "")
+        return ""
+
+@app.get("/p/{board_name}/{post_id}")
+async def pretty_board_card(board_name: str, post_id: int):
+    normalized = "CM" if board_name.lower() == "cm" else board_name
+    if normalized not in BOARD_CONFIGS:
+        return HTMLResponse("<h2>잘못된 게시판입니다.</h2>", status_code=404)
+
+    rows = await fetch_board_latest(normalized, limit=18)
+    post = next((x for x in rows if str(x["id"]) == str(post_id)), None)
+
+    # Old post may not be in latest 18; still make a valid redirect card.
+    if not post:
+        config = BOARD_CONFIGS[normalized]
+        official = (
+            f"https://aion2.plaync.com/ko-kr/board/"
+            f"{config['view']}/view?articleId={post_id}"
+        )
+        title_text = board_card_label(normalized)
+        desc_text = "AION2 공식 게시글 보기"
+    else:
+        official = post["link"]
+        title_text = board_card_label(normalized)
+        desc_text = post["title"]
+
+    og_image = await _official_page_og_image(official)
+
+    safe_title = escape(title_text)
+    safe_desc = escape(desc_text)
+    safe_official = escape(official, quote=True)
+    safe_img = escape(og_image, quote=True)
+
+    image_meta = (
+        f'<meta property="og:image" content="{safe_img}">'
+        if safe_img else ""
+    )
+
+    html = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{safe_title}">
+<meta property="og:description" content="{safe_desc}">
+{image_meta}
+<meta name="twitter:card" content="summary_large_image">
+<meta http-equiv="refresh" content="0;url={safe_official}">
+<title>{safe_title}</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif;
+margin:0;background:#111827;color:#fff;display:grid;place-items:center;min-height:100vh}}
+.card{{width:min(520px,90vw);padding:28px;border-radius:22px;background:#1f2937}}
+h2{{margin:0 0 12px}}p{{color:#d1d5db;line-height:1.6}}a{{color:#93c5fd}}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>{safe_title}</h2>
+<p>{safe_desc}</p>
+<a href="{safe_official}">공식 게시글로 이동</a>
+</div>
+<script>location.replace({json.dumps(official)});</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+@app.get("/openchat/alerts")
+async def openchat_alerts():
+    async with _openchat_alert_lock:
+        state = _load_openchat_alert_state()
+
+        if not isinstance(state.get("bossSent"), list):
+            state["bossSent"] = []
+
+        items = []
+
+        # ---- Board alerts ----
+        latest_by_board = {}
+        for board in ("공지", "CM", "업데이트"):
+            try:
+                rows = await fetch_board_latest(board, limit=18)
+            except Exception:
+                rows = []
+            latest_by_board[board] = rows
+
+        first_run = not state.get("initialized")
+
+        if first_run:
+            for board, rows in latest_by_board.items():
+                if rows:
+                    state["lastSeen"][board] = rows[0]["id"]
+            state["initialized"] = True
+        else:
+            for board, rows in latest_by_board.items():
+                if not rows:
+                    continue
+
+                previous_id = state["lastSeen"].get(board)
+                new_rows = []
+
+                for row in rows:
+                    if previous_id is not None and str(row["id"]) == str(previous_id):
+                        break
+                    new_rows.append(row)
+
+                state["lastSeen"][board] = rows[0]["id"]
+
+                for post in reversed(new_rows):
+                    # Notice alert: ONLY titles containing literal "점검"
+                    if board == "공지" and "점검" not in str(post["title"]):
+                        continue
+
+                    items.append({
+                        "type": "board",
+                        "board": board,
+                        "id": post["id"],
+                        "title": post["title"],
+                        "url": post["link"],
+                    })
+
+        # ---- Boss alerts: 30 minutes before, once ----
+        now = datetime.now(KST)
+
+        sent = set(str(x) for x in state.get("bossSent", []))
+        keep = set()
+
+        try:
+            await refresh_boss_rules()
+        except Exception:
+            pass
+
+        try:
+            maintenance_anchor = await latest_maintenance_anchor()
+        except Exception:
+            maintenance_anchor = AGRO_FALLBACK_ANCHOR
+
+        targets = [
+            ("정령왕 아그로", next_agro_from_anchor(maintenance_anchor, now)),
+            ("감시자 카이라", _next_daily_hours(BOSS_RULES["kairaHours"], now)),
+            ("수호신장 나흐마", _next_weekly(
+                BOSS_RULES["nahmaWeekdays"],
+                BOSS_RULES["nahmaHour"],
+                BOSS_RULES["nahmaMinute"],
+                now,
+            )),
+            ("어비스 보스", _next_weekly(
+                BOSS_RULES["abyssWeekdays"],
+                BOSS_RULES["abyssHour"],
+                BOSS_RULES["abyssMinute"],
+                now,
+            )),
+        ]
+
+        for name, target in targets:
+            minutes = (target - now).total_seconds() / 60.0
+            key = f"{name}|{int(target.timestamp())}"
+
+            if minutes > -180:
+                keep.add(key)
+
+            # 1-minute phone polling + Render wake-up delay tolerance.
+            if 27 <= minutes <= 33 and key not in sent:
+                items.append({
+                    "type": "boss",
+                    "boss": name,
+                    "time": target.strftime("%H:%M"),
+                    "key": key,
+                })
+                sent.add(key)
+                keep.add(key)
+
+        state["bossSent"] = sorted(sent.intersection(keep))
+        _save_openchat_alert_state(state)
+
+        return {
+            "ok": True,
+            "baseline": first_run,
+            "items": items,
+        }
+
+
+@app.get("/c/{nickname}/{server_name}")
+async def character_card(nickname: str, server_name: str):
+    try:
+        data = await asyncio.wait_for(
+            character_card_data(nickname, server_name),
+            timeout=7.5,
+        )
+    except Exception:
+        data = None
+
+    if not data:
+        return HTMLResponse(
+            "<html><body><h2>캐릭터 정보를 찾지 못했습니다.</h2></body></html>",
+            status_code=404,
+        )
+
+    info = data["info"]
+    stones = data["stones"]
+    cp_short = round(info["combatPower"] / 1000) if info["combatPower"] else 0
+
+    profile_image = escape(info.get("profileImage") or "")
+    title = escape(f"{info['name']} · {info['server']} · {info['job']}")
+    desc = escape(f"전투력 {cp_short} · AION2 캐릭터 정보")
+
+    stones_html = "".join(
+        f'<div class="stone"><span>{escape(name)}</span><b>{escape(value)}</b></div>'
+        for name, value in stones
+    )
+    if not stones_html:
+        stones_html = '<div class="muted">캐릭터 기본정보: AION2 공식 정보실 기준</div>'
+
+    html = f"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{desc}">
+<meta property="og:image" content="{profile_image}">
+<meta name="twitter:card" content="summary_large_image">
+<title>{title}</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#0c1018;color:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif}}
+.wrap{{min-height:100vh;padding:24px;display:flex;justify-content:center;align-items:flex-start}}
+.card{{width:min(520px,100%);background:linear-gradient(145deg,#171e2b,#10151f);border:1px solid #2b3444;border-radius:24px;overflow:hidden;box-shadow:0 22px 70px rgba(0,0,0,.45)}}
+.hero{{padding:24px;display:flex;gap:18px;align-items:center;background:radial-gradient(circle at 10% 10%,rgba(100,150,255,.25),transparent 50%)}}
+.avatar{{width:96px;height:96px;border-radius:22px;object-fit:cover;background:#252d3b;border:1px solid #3a465b}}
+.name{{font-size:28px;font-weight:800;margin-bottom:6px}}
+.meta{{color:#aeb9cb;font-size:15px}}
+.cp{{margin-top:8px;font-size:18px;font-weight:700}}
+.section{{padding:20px 24px 24px}}
+.section h3{{margin:0 0 14px;font-size:17px}}
+.stone{{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #252e3c}}
+.stone span{{color:#c7cfdb}}
+.stone b{{color:#fff}}
+.muted{{color:#8e99aa}}
+.badge{{display:inline-block;margin-top:8px;padding:5px 9px;border-radius:999px;background:#202b3c;color:#b8c9e8;font-size:12px}}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+  <div class="hero">
+    <img class="avatar" src="{profile_image}" alt="">
+    <div>
+      <div class="name">{escape(info['name'])}</div>
+      <div class="meta">{escape(info['server'])} · {escape(info['job'])}</div>
+      <div class="cp">전투력 {cp_short}</div>
+      <div class="badge">AION2 CHARACTER</div>
+    </div>
+  </div>
+  <div class="section">
+    <h3>💎 장착 마석 총합</h3>
+    {stones_html}
+  </div>
+</div></div>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+
+@app.get("/debug/upstreams")
+async def debug_upstreams():
+    result = {}
+
+    # Character
+    try:
+        data = await http_json(
+            NOTMETER_API + "/character/v1/search",
+            params={"name": "윤이", "region": "kr", "lang": "ko", "fast": "1"},
+            timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=2.0),
+        )
+        result["character"] = {
+            "ok": True,
+            "count": len(data.get("results") or data.get("characters") or []),
+        }
+    except Exception as e:
+        result["character"] = {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:250],
+        }
+
+    # Field boss
+    try:
+        fb = await fetch_field_boss_cache()
+        result["fieldBoss"] = {
+            "ok": True,
+            "type": type(fb).__name__,
+        }
+    except Exception as e:
+        result["fieldBoss"] = {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:250],
+        }
+
+    # Board
+    try:
+        rows = await fetch_board_latest("공지", limit=1)
+        result["notice"] = {
+            "ok": True,
+            "count": len(rows),
+        }
+    except Exception as e:
+        result["notice"] = {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:250],
+        }
+
+    result["ok"] = all(
+        isinstance(v, dict) and v.get("ok")
+        for k, v in result.items()
+        if k != "ok"
+    )
+    return result
+
+@app.get("/debug/character-search/{nickname}")
+async def debug_character_search(nickname: str):
+    try:
+        rows = await search_characters_all_servers(nickname)
+        return {
+            "ok": True,
+            "count": len(rows),
+            "results": [
+                {
+                    "name": row_name(r),
+                    "serverId": row_server_id(r),
+                    "serverName": row_server_name(r),
+                    "characterId": row_character_id(r),
+                    "combatPower": r.get("combatPower"),
+                    "className": r.get("className"),
+                }
+                for r in rows[:20]
+            ],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": type(e).__name__,
+            "message": str(e)[:400],
+        }
+
+
+
+
+
+
+@app.get("/debug/official-api-search")
+async def debug_official_api_search(nickname: str, server: str | None = None):
+    try:
+        rows = await official_search_characters(nickname, server)
+
+        details = []
+        for row in rows[:10]:
+            info = await official_load_detail(row)
+            details.append({
+                "search": row,
+                "detail": info,
+            })
+
+        return {
+            "ok": True,
+            "version": "v31-official-api",
+            "count": len(rows),
+            "results": details,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "version": "v31-official-api",
+            "error": f"{type(e).__name__}: {str(e)[:400]}",
+        }
+
+
+@app.get("/debug/official-character")
+async def debug_official_character(nickname: str, server: str | None = None):
+    try:
+        resolved = await official_resolve_character(nickname, server)
+        if resolved.get("type") == "detail":
+            info = resolved.get("info") or {}
+            return {
+                "ok": True,
+                "version": "v31-official-api",
+                "type": "detail",
+                "info": info,
+            }
+
+        if resolved.get("type") == "multiple":
+            return {
+                "ok": True,
+                "version": "v31-official-api",
+                "type": "multiple",
+                "items": [
+                    item.get("info") or {}
+                    for item in resolved.get("items") or []
+                ],
+            }
+
+        return {
+            "ok": True,
+            "version": "v31-official-api",
+            "type": "none",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "version": "v31-official-api",
+            "error": f"{type(e).__name__}: {str(e)[:300]}",
+        }
+
+
+@app.get("/debug/boss-schedule")
+async def debug_boss_schedule():
+    await refresh_boss_rules(force=True)
+
+    now = datetime.now(KST)
+    anchor = await latest_maintenance_anchor()
+    agro = next_agro_from_anchor(anchor, now)
+    kaira = _next_daily_hours(BOSS_RULES["kairaHours"], now)
+    nahma = _next_weekly(
+        BOSS_RULES["nahmaWeekdays"],
+        BOSS_RULES["nahmaHour"],
+        BOSS_RULES["nahmaMinute"],
+        now,
+    )
+    abyss = _next_weekly(
+        BOSS_RULES["abyssWeekdays"],
+        BOSS_RULES["abyssHour"],
+        BOSS_RULES["abyssMinute"],
+        now,
+    )
+
+    return {
+        "version": "v31-official-api",
+        "nowKST": now.isoformat(),
+        "maintenanceAnchor": anchor.isoformat(),
+        "rules": BOSS_RULES,
+        "ruleMeta": BOSS_RULES_META,
+        "next": {
+            "agro": agro.isoformat(),
+            "kaira": kaira.isoformat(),
+            "nahma": nahma.isoformat(),
+            "abyss": abyss.isoformat(),
+        },
+    }
+
+
+@app.get("/debug/ranking")
+async def debug_ranking():
+    client = await get_http_client()
+    attempts = []
+
+    for url in RANKING_URLS:
+        try:
+            res = await client.get(
+                url,
+                headers={**HEADERS, "Accept-Encoding": "identity"},
+                timeout=httpx.Timeout(connect=3.0, read=30.0, write=3.0, pool=2.0),
+            )
+            raw = res.content
+            row = {
+                "url": url,
+                "status": res.status_code,
+                "bytes": len(raw),
+                "gzip": bool(len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B),
+            }
+
+            if 200 <= res.status_code < 300:
+                try:
+                    decoded = gzip.decompress(raw) if row["gzip"] else raw
+                    data = json.loads(decoded.decode("utf-8"))
+                    row["json"] = True
+                    row["topKeys"] = list(data.keys())[:12] if isinstance(data, dict) else []
+                    row["classRankings"] = (
+                        len(data.get("classRankings") or {})
+                        if isinstance(data, dict) and isinstance(data.get("classRankings"), dict)
+                        else 0
+                    )
+                except Exception as parse_error:
+                    row["json"] = False
+                    row["parseError"] = f"{type(parse_error).__name__}: {str(parse_error)[:180]}"
+            attempts.append(row)
+        except Exception as e:
+            attempts.append({
+                "url": url,
+                "error": f"{type(e).__name__}: {str(e)[:180]}",
+            })
+
+    try:
+        cache = await fetch_ranking_cache()
+        active = {
+            "ok": True,
+            "topKeys": list(cache.keys())[:12] if isinstance(cache, dict) else [],
+            "classRankings": (
+                len(cache.get("classRankings") or {})
+                if isinstance(cache, dict) and isinstance(cache.get("classRankings"), dict)
+                else 0
+            ),
+        }
+    except Exception as e:
+        active = {
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:180]}",
+        }
+
+    return {
+        "version": "v26-ranking-fix",
+        "attempts": attempts,
+        "activeCache": active,
+    }
+
+
+@app.get("/debug/v25")
+async def debug_v25():
+    result = {
+        "ok": True,
+        "version": "v25-alert-board-fix",
+        "timeKST": datetime.now(KST).isoformat(),
+        "boards": {},
+        "alerts": {},
+    }
+
+    for board in ("공지", "CM", "업데이트"):
+        try:
+            rows = await fetch_board_latest(board, limit=18 if board == "공지" else 3)
+            result["boards"][board] = {
+                "ok": True,
+                "count": len(rows),
+                "latest": rows[0] if rows else None,
+            }
+        except Exception as e:
+            result["boards"][board] = {
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:180]}",
+            }
+
+    try:
+        now = datetime.now(KST)
+        target = next_kaira_spawn(now)
+        result["alerts"]["nextKaira"] = target.isoformat()
+        result["alerts"]["minutesToKaira"] = round((target - now).total_seconds() / 60, 1)
+    except Exception as e:
+        result["alerts"]["kairaError"] = f"{type(e).__name__}: {str(e)[:180]}"
+
+    try:
+        state = _load_openchat_alert_state()
+        result["alerts"]["state"] = state
+    except Exception as e:
+        result["alerts"]["stateError"] = f"{type(e).__name__}: {str(e)[:180]}"
+
+    return result
+
+
+@app.get("/openchat")
+async def openchat(msg: str = ""):
+    command = clean_command(msg)
+    if not command.startswith("!"):
+        return PlainTextResponse("명령어 앞에 !를 붙여주세요.", media_type="text/plain; charset=utf-8")
+
+    body = command[1:].strip()
+    if not body:
+        return PlainTextResponse("!윤이 / !랭킹 윤이지켈 / !필보 / !인원 / !공지 / !CM", media_type="text/plain; charset=utf-8")
+
+    # 봇 전용 명령은 반드시 여기서 끝난다. 캐릭터 검색으로 fall-through 금지.
+    if body in ("설명", "도움", "명령어", "사용법"):
+        return PlainTextResponse(
+            "📘 AION2 봇 사용법\n\n"
+            "⚔️ 캐릭터\n!윤이\n!윤이지켈 / !지켈윤이\n!윤이 지켈\n\n"
+            "🏆 랭킹\n!랭킹 윤이지켈\n\n"
+            "🐲 필드보스\n!필보 / !아그로 / !카이라 / !나흐마 / !어비스\n\n"
+            "📢 소식\n!공지 / !CM / !업데이트\n\n"
+            "👥 기타\n!인원\n\n"
+            "🔔 알림\n!알림켜기 / !알림끄기 / !알림상태",
+            media_type="text/plain; charset=utf-8",
+        )
+
+    if body == "인원":
+        return PlainTextResponse(
+            "👥 인원표\n\nhttps://docs.google.com/spreadsheets/d/1TDkZojKWuHNfu5cl1lpuqVZvTKF6W9-c9WLjga8ihIc/edit?gid=0#gid=0",
+            media_type="text/plain; charset=utf-8",
+        )
+
+    if body in ("알림켜기", "알림끄기", "알림상태", "테스트"):
+        text = "✅ AION2 v31 서버 정상" if body == "테스트" else "📱 알림 설정은 휴대폰 봇에서 처리됩니다."
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+
+    if body == "랭킹" or body.startswith("랭킹 ") or (body.startswith("랭킹") and len(body) > 2):
+        query = body[2:].strip()
+        try:
+            result = await asyncio.wait_for(ranking_lookup_smart(query), timeout=35.0)
+        except asyncio.TimeoutError:
+            result = "⚠️ 랭킹 조회 지연"
+        except Exception:
+            result = "⚠️ 랭킹 정보를 불러오지 못했습니다."
+        return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+    if body in ("아그로", "카이라", "나흐마", "어비스", "어비스보스"):
+        try:
+            result = await asyncio.wait_for(field_boss_lookup(body), timeout=5.0)
+        except Exception:
+            result = "⚠️ 필드보스 조회 실패"
+        return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+    if body == "필보":
+        try:
+            result = await asyncio.wait_for(field_boss_lookup(), timeout=5.0)
+        except Exception:
+            result = "⚠️ 필드보스 조회 실패"
+        return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+    board_command = "CM" if body.casefold() == "cm" else body
+    if board_command in ("공지", "CM", "업데이트"):
+        try:
+            result = await asyncio.wait_for(board_lookup(board_command), timeout=5.0)
+        except Exception:
+            result = f"⚠️ {board_command} 조회 실패"
+        return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+    boss_query = normalize_boss_query(body)
+    if any(boss_query in normalize_boss_query(info["name"]) for info in BOSS_BY_CODE.values()):
+        try:
+            result = await asyncio.wait_for(field_boss_lookup(body), timeout=5.0)
+        except Exception:
+            result = "⚠️ 필드보스 조회 실패"
+        return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+    # 위 전용 명령 어느 것도 아닐 때만 캐릭터 검색.
+    try:
+        result = await asyncio.wait_for(character_lookup_smart(body), timeout=7.0)
+    except asyncio.TimeoutError:
+        result = "⚠️ 캐릭터 조회 지연"
+    except Exception:
+        result = "⚠️ 캐릭터 조회 실패"
+    if not result:
+        result = "캐릭터를 찾지 못했습니다."
+    return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
+
+
+@app.post("/kakao/skill")
+async def kakao_skill(request: Request):
+    try:
+        payload = await request.json()
+        command = clean_command(
+            payload.get("userRequest", {}).get("utterance") or ""
+        )
+
+        if not command.startswith("!"):
+            return JSONResponse(
+                kakao_text("명령어 앞에 !를 붙여주세요.\n예: !윤이 / !필보")
+            )
+
+        body = command[1:].strip()
+
+        if not body:
+            return JSONResponse(
+                kakao_text("사용법\n!윤이\n!필보\n!가르투아\n!아그로")
+            )
+
+        # ---------- Field boss ----------
+        if body == "필보":
+            try:
+                result = await asyncio.wait_for(
+                    field_boss_lookup(),
+                    timeout=4.3,
+                )
+                return JSONResponse(kakao_text(result))
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    kakao_text("⚠️ 필드보스 조회가 지연되고 있습니다.")
+                )
+            except Exception:
+                return JSONResponse(
+                    kakao_text("⚠️ 필드보스 정보를 불러오지 못했습니다.")
+                )
+
+        # If input matches a known boss name fragment, handle as boss lookup.
+        boss_query = normalize_boss_query(body)
+        known_boss_match = any(
+            boss_query in normalize_boss_query(info["name"])
+            for info in BOSS_BY_CODE.values()
+        )
+
+        if known_boss_match:
+            try:
+                result = await asyncio.wait_for(
+                    field_boss_lookup(body),
+                    timeout=4.3,
+                )
+                return JSONResponse(kakao_text(result))
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    kakao_text("⚠️ 필드보스 조회가 지연되고 있습니다.")
+                )
+            except Exception:
+                return JSONResponse(
+                    kakao_text("⚠️ 필드보스 정보를 불러오지 못했습니다.")
+                )
+
+        # ---------- Alert subscription ----------
+        if body == "알림등록":
+            _ok, message = _register_alert_user(payload)
+            return JSONResponse(kakao_text(message))
+
+        if body == "알림해제":
+            _ok, message = _unregister_alert_user(payload)
+            return JSONResponse(kakao_text(message))
+
+        # ---------- Official boards ----------
+        board_command = "CM" if body.lower() == "cm" else body
+        if board_command in BOARD_CONFIGS:
+            try:
+                result = await asyncio.wait_for(
+                    board_lookup(board_command),
+                    timeout=4.3,
+                )
+                return JSONResponse(kakao_text(result))
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    kakao_text(f"⚠️ {board_command} 조회가 지연되고 있습니다.")
+                )
+            except Exception:
+                return JSONResponse(
+                    kakao_text(f"⚠️ {board_command} 정보를 불러오지 못했습니다.")
+                )
+
+        # ---------- Character ----------
+        try:
+            result = await asyncio.wait_for(
+                character_lookup_smart(body),
+                timeout=4.35,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                kakao_text(
+                    "⚠️ 캐릭터 조회가 지연되고 있습니다.\n"
+                    "한 번 더 입력해 주세요."
+                )
+            )
+
+        if not result:
+            return JSONResponse(
+                kakao_text(
+                    f"🔎 {body}\n"
+                    "전 서버에서 캐릭터를 찾지 못했습니다."
+                )
+            )
+
+        return JSONResponse(kakao_text(result))
+
+    except Exception:
+        return JSONResponse(
+            kakao_text("⚠️ 조회 중 오류가 발생했습니다.")
+        )
