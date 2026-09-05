@@ -8601,7 +8601,7 @@ async def debug_v25():
 PARTY_SHEET_ID = "1TDkZojKWuHNfu5cl1lpuqVZvTKF6W9-c9WLjga8ihIc"
 PARTY_CONFIGS = {
     "무스펠": {"sheet": "파티편성", "gid": "234073660", "range": "A1:D31"},
-    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A18:D31"},
+    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A1:D31"},
     "성역4": {"sheet": "성역4", "gid": None, "range": "A1:D31"},
 }
 
