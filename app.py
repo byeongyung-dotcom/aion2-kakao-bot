@@ -8776,15 +8776,15 @@ async def party_image(section_name: str):
                     continue
             return ImageFont.load_default()
 
-        title_font = load_font(30, True)
-        header_font = load_font(21, True)
-        body_font = load_font(20, False)
+        title_font = load_font(24, True)
+        header_font = load_font(17, True)
+        body_font = load_font(16, False)
 
         # Fixed 5-column sheet layout: 파티 / 이름 / 직업 / 전투력 / 비고
-        col_widths = [145, 225, 150, 185, 265]
-        row_h = 52
-        title_h = 68
-        margin = 18
+        col_widths = [115, 175, 125, 145, 210]
+        row_h = 42
+        title_h = 58
+        margin = 12
         width = sum(col_widths) + margin * 2
         height = title_h + len(rows) * row_h + margin
 
