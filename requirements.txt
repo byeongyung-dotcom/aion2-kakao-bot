@@ -1,0 +1,4 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+httpx[http2]==0.28.1
+Pillow>=10.0,<13
