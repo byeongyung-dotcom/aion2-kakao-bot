@@ -9035,8 +9035,14 @@ def board_card_url(board_name, post_id):
         + quote(str(post_id), safe="")
     )
 
-def board_card_label(board_name):
+def board_card_label(board_name, post_title=""):
+    title = str(post_title or "")
+    low = title.lower()
     if board_name == "공지":
+        if "점검" in title:
+            return "🔧 AION2 점검 공지"
+        if "라이브" in title or "live" in low:
+            return "🔴 AION2 라이브 공지"
         return "📢 AION2 공지"
     if board_name == "CM":
         return "📢 AION2 CM"
@@ -9097,7 +9103,7 @@ async def pretty_board_card(board_name: str, post_id: int):
         desc_text = "AION2 공식 게시글 보기"
     else:
         official = post["link"]
-        title_text = board_card_label(normalized)
+        title_text = board_card_label(normalized, post.get("title") or "")
         desc_text = post["title"]
 
     og_image = await _official_page_og_image(official)
@@ -9693,9 +9699,20 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     key = f"{board}:{post['id']}"
                     if key in known_pending:
                         continue
+                    card_url = board_card_url(board, post["id"])
                     item = {
-                        "type": "board", "board": board, "kind": kind,
-                        "id": post["id"], "title": post["title"], "key": key,
+                        # IMPORTANT: keep this out of the phone's old "board" text branch.
+                        # V8 phone code will fall through to item.message and send ONLY the URL,
+                        # exactly like character lookup, so Kakao renders the OG preview card.
+                        "type": "board_card",
+                        "board": board,
+                        "kind": kind,
+                        "id": post["id"],
+                        "title": post["title"],
+                        "message": card_url,
+                        "cardUrl": card_url,
+                        "officialUrl": str(post.get("link") or ""),
+                        "key": key,
                     }
                     pending.append({"created": now_epoch, "item": item})
                     known_pending.add(key)
