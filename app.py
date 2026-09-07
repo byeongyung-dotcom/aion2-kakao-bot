@@ -8120,7 +8120,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <button id="notifyOffBtn" class="notifybtn off">끄기</button>
           </div>
         </div>
-        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 시간과 새 공지/CM/업데이트를 갤럭시탭 알림으로 받습니다.</div>
+        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 30분 전·10분 전, 새 공지/CM/업데이트, 점검으로 인한 아그로 시간 변경을 갤럭시탭 알림으로 받습니다.</div>
       </div>
 
       <div class="card section">
@@ -9163,6 +9163,121 @@ def _pwa_alert_release_lease(room, alert_key):
     _save_openchat_alert_state(state)
 
 
+
+def _agro_phase_shift_minutes(old_anchor, new_anchor):
+    """Return the actual Agro cycle shift in minutes (-360..360).
+
+    Agro repeats every 12 hours, so a 12-hour clock difference produces the
+    same spawn cycle and should not be announced as a schedule change.
+    """
+    if old_anchor is None or new_anchor is None:
+        return 0
+    old_m = old_anchor.hour * 60 + old_anchor.minute
+    new_m = new_anchor.hour * 60 + new_anchor.minute
+    delta = (new_m - old_m) % (12 * 60)
+    if delta > 6 * 60:
+        delta -= 12 * 60
+    return int(delta)
+
+
+def _pwa_maintenance_change_candidate(now=None):
+    """Return one pending maintenance-driven Agro schedule change.
+
+    The first observed maintenance source is only a baseline. A notification is
+    created only when a genuinely newer maintenance source changes the 12-hour
+    Agro phase. The marker is advanced only after a successful push, so a
+    transient push failure is retried on the next check.
+    """
+    now = now or datetime.now(KST)
+    data = _load_boss_schedule_overrides()
+    current = data.get("agroOfficial") if isinstance(data.get("agroOfficial"), dict) else {}
+    source_id = str(current.get("sourceId") or "").strip()
+    source_title = str(current.get("sourceTitle") or "").strip()
+    new_anchor = _parse_kst_iso(current.get("anchor"))
+    if not source_id or new_anchor is None:
+        return None
+
+    marker = data.get("pwaMaintenanceAlert") if isinstance(data.get("pwaMaintenanceAlert"), dict) else {}
+    marker_source = str(marker.get("sourceId") or "").strip()
+    old_anchor = _parse_kst_iso(marker.get("anchor"))
+
+    # First run after this feature is installed: establish a baseline without
+    # sending an old maintenance notice as if it were new.
+    if not marker.get("initialized"):
+        data["pwaMaintenanceAlert"] = {
+            "initialized": True,
+            "sourceId": source_id,
+            "sourceTitle": source_title,
+            "anchor": new_anchor.isoformat(),
+            "updatedAt": now.isoformat(),
+        }
+        _save_boss_schedule_overrides(data)
+        return None
+
+    if marker_source == source_id:
+        return None
+
+    phase_delta = _agro_phase_shift_minutes(old_anchor, new_anchor)
+
+    # A new maintenance notice with the same 12-hour Agro phase does not change
+    # Agro spawn times. Advance the marker silently so it is not reconsidered.
+    if old_anchor is not None and phase_delta == 0:
+        data["pwaMaintenanceAlert"] = {
+            "initialized": True,
+            "sourceId": source_id,
+            "sourceTitle": source_title,
+            "anchor": new_anchor.isoformat(),
+            "updatedAt": now.isoformat(),
+        }
+        _save_boss_schedule_overrides(data)
+        return None
+
+    next_agro = next_agro_from_anchor(new_anchor, now)
+    old_clock = old_anchor.strftime("%H:%M") if old_anchor is not None else "기존"
+    new_clock = new_anchor.strftime("%H:%M")
+    if phase_delta > 0:
+        shift_text = f"+{phase_delta // 60}시간 {phase_delta % 60}분" if phase_delta % 60 else f"+{phase_delta // 60}시간"
+    elif phase_delta < 0:
+        mins = abs(phase_delta)
+        shift_text = f"-{mins // 60}시간 {mins % 60}분" if mins % 60 else f"-{mins // 60}시간"
+    else:
+        shift_text = "변경"
+
+    body = f"점검 종료 {old_clock} → {new_clock} · 아그로 {shift_text} · 다음 {next_agro.strftime('%m/%d %H:%M')}"
+    if source_title:
+        body += f"\n{source_title[:70]}"
+
+    return {
+        "sourceId": source_id,
+        "sourceTitle": source_title,
+        "anchor": new_anchor,
+        "payload": {
+            "title": "⚠️ 아그로 시간 변경",
+            "body": body,
+            "url": "/",
+            "tag": "agro-maintenance-" + re.sub(r"[^0-9A-Za-z_-]", "", source_id)[:80],
+        },
+    }
+
+
+def _pwa_mark_maintenance_change_sent(candidate, now=None):
+    if not isinstance(candidate, dict):
+        return False
+    anchor = candidate.get("anchor")
+    if anchor is None:
+        return False
+    now = now or datetime.now(KST)
+    data = _load_boss_schedule_overrides()
+    data["pwaMaintenanceAlert"] = {
+        "initialized": True,
+        "sourceId": str(candidate.get("sourceId") or ""),
+        "sourceTitle": str(candidate.get("sourceTitle") or ""),
+        "anchor": anchor.astimezone(KST).isoformat(),
+        "updatedAt": now.isoformat(),
+    }
+    return _save_boss_schedule_overrides(data)
+
+
 async def _run_pwa_push_alert_check():
     if not _pwa_push_configured():
         return {"ok": False, "configured": False, "error": "VAPID_NOT_CONFIGURED"}
@@ -9170,14 +9285,30 @@ async def _run_pwa_push_alert_check():
         return {"ok": True, "configured": True, "subscriptions": 0, "items": 0, "sent": 0}
 
     async with PWA_PUSH_CHECK_LOCK:
+        # Refresh the official maintenance anchor first. The normal source layer
+        # caches this for five minutes, so this does not hammer the official site.
+        try:
+            await latest_maintenance_anchor()
+        except Exception:
+            pass
+
+        maintenance_result = None
+        maintenance_candidate = _pwa_maintenance_change_candidate(datetime.now(KST))
+        if maintenance_candidate:
+            maintenance_result = await _pwa_send_payload_to_all(maintenance_candidate["payload"])
+            if maintenance_result.get("ok"):
+                _pwa_mark_maintenance_change_sent(maintenance_candidate)
+
         body = await openchat_alerts(room=PWA_PUSH_ROOM)
         items = body.get("items") if isinstance(body, dict) else []
         if not isinstance(items, list):
             items = []
 
-        sent_total = 0
-        failed_total = 0
+        sent_total = int((maintenance_result or {}).get("sent") or 0)
+        failed_total = int((maintenance_result or {}).get("failed") or 0)
         results = []
+        if maintenance_result is not None:
+            results.append({"key": "maintenance-agro-change", **maintenance_result})
         for item in items:
             if not isinstance(item, dict):
                 continue
