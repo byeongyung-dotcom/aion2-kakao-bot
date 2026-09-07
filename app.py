@@ -8053,6 +8053,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
+PWA_APP_VERSION = "V7"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -8075,7 +8076,7 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 .top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:13px}.logo{width:54px;height:54px;border-radius:16px;background:linear-gradient(145deg,#1d2d56,#171d33);border:1px solid #5f63da;display:grid;place-items:center;font-weight:900;font-size:21px;box-shadow:0 12px 30px #0007}
 h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px}
-.install{border:1px solid #5966a6;background:#1a2440;color:#fff;border-radius:12px;padding:11px 15px;font-weight:700;cursor:pointer}
+.topactions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.versionbadge{border:1px solid #34415f;background:#10182a;color:#9fb2d3;border-radius:999px;padding:7px 9px;font-size:10px;font-weight:800}.install{border:1px solid #5966a6;background:#1a2440;color:#fff;border-radius:12px;padding:11px 15px;font-weight:700;cursor:pointer}.updatebtn{display:none;border:1px solid #2f8f74;background:#123229;color:#dfffee;border-radius:12px;padding:11px 13px;font-weight:800;cursor:pointer}
 .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{background:linear-gradient(180deg,#161f34,#11182a);border:1px solid var(--line);border-radius:18px;padding:17px;box-shadow:0 16px 45px #0004}.card h2{font-size:16px;margin:0 0 13px}.search{display:grid;grid-template-columns:1fr 150px auto;gap:9px}input,select{width:100%;border:1px solid #34415f;background:#0d1424;color:#fff;border-radius:12px;padding:13px;font-size:16px;outline:none}input:focus,select:focus{border-color:var(--blue)}
 .dashboard{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}.dashitem{min-height:105px;border:1px solid #2f3b5a;background:linear-gradient(160deg,#141e34,#0f1729);border-radius:15px;padding:13px;cursor:pointer}.dashitem:active{transform:scale(.99)}.dashtitle{font-size:11px;color:#8fa0bc;margin-bottom:8px}.dashvalue{font-size:17px;font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashsub{font-size:11px;color:#8493ad;margin-top:7px;line-height:1.35;min-height:28px}.countdown{font-variant-numeric:tabular-nums;letter-spacing:.2px}.favbosschips{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.favbosschip{border:1px solid #354363;background:#10192b;color:#cbd7ef;border-radius:999px;padding:4px 7px;font-size:9px;line-height:1.1}.dashgood{color:#74e8bd}.dashwarn{color:#ffd479}.dashbad{color:#ff9aa9}.favtools{display:flex;gap:6px;margin-top:8px}.favmini{flex:1;border:1px solid #354363;background:#111a2e;color:#eaf0ff;border-radius:8px;padding:6px 7px;font-size:10px;font-weight:750;cursor:pointer}
 .primary{border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;border-radius:12px;padding:0 17px;font-weight:800;font-size:15px;cursor:pointer}.actions{display:flex;gap:9px;margin-top:10px}.ghost{flex:1;border:1px solid #3a4868;background:#111a2e;color:#eaf0ff;border-radius:11px;padding:11px;font-weight:700;cursor:pointer}
@@ -8093,7 +8094,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 <div class="wrap">
   <div class="top">
     <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 전용 · 기존 서버 기능 그대로</div></div></div>
-    <button id="installBtn" class="install">앱 설치</button>
+    <div class="topactions"><span id="versionBadge" class="versionbadge">V7</span><button id="updateBtn" class="updatebtn">새 버전 적용</button><button id="installBtn" class="install">앱 설치</button></div>
   </div>
 
   <div class="dashboard">
@@ -8164,6 +8165,9 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button id="notifyNextBtn" class="notifybtn">⏱️ 다음 알림</button>
           <button id="notifyHistoryBtn" class="notifybtn">🧾 알림 기록</button>
           <button id="notifyHealthBtn" class="notifybtn">🛡️ 시스템 상태</button>
+          <button id="test30Btn" class="notifybtn test">30분 테스트</button>
+          <button id="test10Btn" class="notifybtn test">10분 테스트</button>
+          <button id="testAgroBtn" class="notifybtn test">아그로 변경 테스트</button>
         </div>
         <div id="notifySettingsBox" class="settingsbox">
           <div class="settingshead"><b>알림 세부 설정</b><span style="font-size:11px;color:#7f8da8">이 태블릿용 PWA 설정</span></div>
@@ -8500,6 +8504,17 @@ async function testPush(){
     toast('테스트 알림을 보냈습니다.');
   }catch(e){toast('테스트 실패: '+(e?.message||e));}
 }
+async function sendScenarioTest(kind){
+  try{
+    const sub=await getPushSubscription();
+    if(!sub)return toast('먼저 알림 켜기를 눌러주세요.');
+    const r=await fetch('/api/push/test-scenario',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint,kind})});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'테스트 실패');
+    const label=kind==='lead30'?'30분 전':kind==='lead10'?'10분 전':'아그로 시간 변경';
+    toast(label+' 테스트 알림을 보냈습니다.');
+  }catch(e){toast('시나리오 테스트 실패: '+(e?.message||e));}
+}
 async function disablePush(){
   try{
     const sub=await getPushSubscription();
@@ -8514,6 +8529,9 @@ async function disablePush(){
 $('notifyOnBtn').onclick=enablePush;
 $('notifyTestBtn').onclick=testPush;
 $('notifyOffBtn').onclick=disablePush;
+$('test30Btn').onclick=()=>sendScenarioTest('lead30');
+$('test10Btn').onclick=()=>sendScenarioTest('lead10');
+$('testAgroBtn').onclick=()=>sendScenarioTest('agrochange');
 window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100);setTimeout(renderFavBossChecks,1200)});
 setInterval(refreshDashboard,60000);
 setInterval(tickDashboardCountdowns,1000);
@@ -8522,7 +8540,38 @@ let deferredPrompt=null;const installBtn=$('installBtn');
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
 installBtn.onclick=async()=>{if(deferredPrompt){deferredPrompt.prompt();await deferredPrompt.userChoice;deferredPrompt=null}else{toast('Chrome 메뉴(⋮) → 앱 설치 또는 홈 화면에 추가')}};
 window.addEventListener('appinstalled',()=>{installBtn.textContent='설치됨';toast('AION2 TOOL 설치 완료')});
-if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}))}
+
+let reloadingForSW=false;
+const updateBtn=$('updateBtn');
+function showUpdateButton(reg){
+  updateBtn.style.display='inline-block';
+  updateBtn.onclick=()=>{if(reg&&reg.waiting){reg.waiting.postMessage({type:'SKIP_WAITING'});}else{location.reload();}};
+}
+async function setupServiceWorker(){
+  if(!('serviceWorker' in navigator))return;
+  try{
+    const reg=await navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'});
+    window.__aion2SW=reg;
+    if(reg.waiting)showUpdateButton(reg);
+    reg.addEventListener('updatefound',()=>{
+      const w=reg.installing;
+      if(!w)return;
+      w.addEventListener('statechange',()=>{
+        if(w.state==='installed'&&navigator.serviceWorker.controller)showUpdateButton(reg);
+      });
+    });
+    await reg.update().catch(()=>{});
+  }catch(e){}
+}
+navigator.serviceWorker?.addEventListener('controllerchange',()=>{
+  if(reloadingForSW)return;
+  reloadingForSW=true;
+  location.reload();
+});
+window.addEventListener('load',()=>{
+  setupServiceWorker();
+  fetch('/api/app/version',{cache:'no-store'}).then(r=>r.json()).then(d=>{if(d.version)$('versionBadge').textContent=d.version;}).catch(()=>{});
+});
 </script>
 </body>
 </html>"""
@@ -8543,19 +8592,23 @@ PWA_MANIFEST = {
     ]
 }
 
-PWA_SW = r"""const CACHE='aion2-tool-shell-v4';
+PWA_SW = r"""const CACHE='aion2-tool-shell-v7';
 const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
-self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
+self.addEventListener('message',e=>{if(e.data&&e.data.type==='SKIP_WAITING')self.skipWaiting()});
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const u=new URL(e.request.url);
   if(u.origin!==location.origin)return;
   if(u.pathname.startsWith('/api/')||u.pathname.startsWith('/openchat')||u.pathname.startsWith('/alerts/')||u.pathname.startsWith('/c/')||u.pathname.startsWith('/detail'))return;
   if(e.request.mode==='navigate'){
-    e.respondWith(fetch(e.request).catch(()=>caches.match('/')));return;
+    e.respondWith(fetch(e.request).then(r=>{const copy=r.clone();caches.open(CACHE).then(c=>c.put('/',copy));return r}).catch(()=>caches.match('/')));return;
   }
-  e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
+  e.respondWith(caches.match(e.request).then(cached=>{
+    const network=fetch(e.request).then(r=>{if(r&&r.ok)caches.open(CACHE).then(c=>c.put(e.request,r.clone()));return r});
+    return cached||network;
+  }));
 });
 self.addEventListener('push',event=>{
   let d={title:'AION2 TOOL',body:'새 알림이 있습니다.',url:'/'};
@@ -8579,6 +8632,11 @@ self.addEventListener('notificationclick',event=>{
     if(clients.openWindow)return clients.openWindow(target);
   }));
 });"""
+
+@app.get("/api/app/version")
+async def pwa_app_version():
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07"}
+
 
 @app.get("/manifest.webmanifest")
 async def pwa_manifest():
@@ -9842,6 +9900,7 @@ async def pwa_push_status():
     return {
         "ok": True,
         "configured": _pwa_push_configured(),
+        "appVersion": PWA_APP_VERSION,
         "subscriptions": len(_load_pwa_push_subscriptions()),
         "persistentStorage": AION2_STORAGE_PERSISTENT,
         "scheduler": scheduler,
@@ -9955,8 +10014,53 @@ async def pwa_push_test(request: Request):
     return JSONResponse(result, status_code=status)
 
 
+@app.post("/api/push/test-scenario")
+async def pwa_push_test_scenario(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    endpoint = str((data or {}).get("endpoint") or "").strip()
+    kind = str((data or {}).get("kind") or "").strip().lower()
+    if not endpoint:
+        return JSONResponse({"ok": False, "error": "NO_ENDPOINT"}, status_code=400)
+
+    now = datetime.now(KST)
+    if kind == "lead30":
+        payload = {
+            "title": "🐲 [테스트] 아그로 30분 전",
+            "body": "정령왕 아그로 출현까지 30분 · 실제 자동알림 형식 점검",
+            "url": "/",
+            "tag": "aion2-test-lead30-" + str(int(time.time())),
+        }
+    elif kind == "lead10":
+        payload = {
+            "title": "🚨 [테스트] 아그로 10분 전",
+            "body": "정령왕 아그로 출현까지 10분 · 준비하세요.",
+            "url": "/",
+            "tag": "aion2-test-lead10-" + str(int(time.time())),
+        }
+    elif kind == "agrochange":
+        nxt = now + timedelta(hours=2)
+        payload = {
+            "title": "⚠️ [테스트] 아그로 시간 변경",
+            "body": f"점검 종료 06:00 → 08:00 · 아그로 +2시간 · 다음 {nxt.strftime('%m/%d %H:%M')}",
+            "url": "/",
+            "tag": "aion2-test-agrochange-" + str(int(time.time())),
+        }
+    else:
+        return JSONResponse({"ok": False, "error": "BAD_TEST_KIND"}, status_code=400)
+
+    result = await _pwa_send_payload_to_all(payload, only_endpoint=endpoint)
+    if result.get("ok"):
+        _record_pwa_push_history(payload)
+    status = 200 if result.get("ok") else 500
+    return JSONResponse({"ok": bool(result.get("ok")), "kind": kind, **result}, status_code=status)
+
+
 @app.get("/alerts/check")
 async def alerts_check(secret: str = ""):
+
     expected = str(os.getenv("ALERT_CRON_SECRET") or "").strip()
     if expected and str(secret or "") != expected:
         return JSONResponse({"ok": False, "error": "UNAUTHORIZED"}, status_code=403)
