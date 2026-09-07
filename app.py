@@ -8126,6 +8126,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button id="notifySettingsBtn" class="notifybtn">⚙️ 알림 설정</button>
           <button id="notifyNextBtn" class="notifybtn">⏱️ 다음 알림</button>
           <button id="notifyHistoryBtn" class="notifybtn">🧾 알림 기록</button>
+          <button id="notifyHealthBtn" class="notifybtn">🛡️ 시스템 상태</button>
         </div>
         <div id="notifySettingsBox" class="settingsbox">
           <div class="settingshead"><b>알림 세부 설정</b><span style="font-size:11px;color:#7f8da8">이 태블릿용 PWA 설정</span></div>
@@ -8292,10 +8293,27 @@ async function showPushHistory(){
     renderText(t.trim()||'아직 전송된 알림 기록이 없습니다.'); statusEl.textContent='최근 '+rows.length+'건';
   }catch(e){renderText('알림 기록 조회 실패\n'+(e?.message||e));}
 }
+async function showPushHealth(){
+  statusEl.textContent='알림 시스템 점검 중…';
+  try{
+    const d=await fetch('/api/push/diagnostics',{cache:'no-store'}).then(r=>r.json());
+    const ext=d.lastExternalMinutes;
+    const bg=d.lastBackgroundMinutes;
+    let t='🛡️ 앱 알림 시스템 상태\n\n';
+    t+='푸시 키 : '+(d.configured?'정상':'설정 필요')+'\n';
+    t+='등록 기기 : '+(d.subscriptions||0)+'대\n';
+    t+='외부 1분 체크 : '+(d.externalCronHealthy?'정상':'미연결/지연')+(ext==null?'':' · '+ext+'분 전')+'\n';
+    t+='내부 체크 : '+(d.backgroundHealthy?'정상':'대기/지연')+(bg==null?'':' · '+bg+'분 전')+'\n';
+    t+='서버 저장 : '+(d.persistentStorage?'영구 저장':'임시 저장(Render 무료 서버)')+'\n\n';
+    t+=(d.recommendation||'');
+    renderText(t); statusEl.textContent=d.externalCronHealthy?'알림 감시 정상':'외부 체크 연결 권장';
+  }catch(e){renderText('알림 시스템 점검 실패\n'+(e?.message||e));}
+}
 $('notifySettingsBtn').onclick=()=>{$('notifySettingsBox').classList.toggle('open');loadNotifyPrefs();};
 $('saveNotifyPrefs').onclick=saveNotifyPrefs;
 $('notifyNextBtn').onclick=showNextAlerts;
 $('notifyHistoryBtn').onclick=showPushHistory;
+$('notifyHealthBtn').onclick=showPushHealth;
 async function enablePush(){
   try{
     if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){
@@ -8869,7 +8887,10 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             for lead in _get_schedule_alert_leads(name, room):
                 # Up to 3 minutes of retry time. For a 2m test lead, retry
                 # until just before the event instead of disappearing after one GET.
-                window = min(3, lead)
+                # PWA push gets a wider retry/catch-up window so a brief
+                # Render cold start or one missed external tick does not lose
+                # the 30m/10m alert. Messenger rooms keep the tighter 3m window.
+                window = min(6 if room_key == PWA_PUSH_ROOM else 3, lead)
                 if max(0, lead - window) < minutes <= lead:
                     items.append({
                         "type": item_type,
@@ -8877,6 +8898,7 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                         "content": name if item_type == "content" else None,
                         "time": target.strftime("%H:%M"),
                         "alertMinutes": lead,
+                        "remainingMinutes": max(0, int(round(minutes))),
                         "key": _scheduled_alert_key(room, name, target, lead),
                         "_legacyKey": _legacy_scheduled_alert_key(name, target, lead),
                     })
@@ -9073,6 +9095,68 @@ PWA_PUSH_HISTORY_FILE = _state_path(
     legacy_paths=("/tmp/aion2_pwa_push_history.json",),
 )
 
+PWA_PUSH_SCHEDULER_FILE = _state_path(
+    "PWA_PUSH_SCHEDULER_FILE",
+    "pwa_push_scheduler.json",
+    legacy_paths=("/tmp/aion2_pwa_push_scheduler.json",),
+)
+
+def _default_pwa_scheduler_state():
+    return {
+        "lastCheckAt": "",
+        "lastSuccessAt": "",
+        "lastExternalAt": "",
+        "lastBackgroundAt": "",
+        "lastDurationMs": 0,
+        "lastSent": 0,
+        "lastFailed": 0,
+        "lastItems": 0,
+        "lastError": "",
+        "checks": 0,
+    }
+
+def _load_pwa_scheduler_state():
+    raw = _safe_json_load(PWA_PUSH_SCHEDULER_FILE, _default_pwa_scheduler_state())
+    state = _default_pwa_scheduler_state()
+    if isinstance(raw, dict):
+        state.update({k: raw.get(k, v) for k, v in state.items()})
+    return state
+
+def _save_pwa_scheduler_state(state):
+    return _atomic_json_write(PWA_PUSH_SCHEDULER_FILE, state)
+
+def _scheduler_stamp(source="background", *, ok=None, sent=None, failed=None, items=None, duration_ms=None, error=""):
+    now = datetime.now(KST)
+    state = _load_pwa_scheduler_state()
+    state["lastCheckAt"] = now.isoformat()
+    if ok is None:
+        state["checks"] = int(state.get("checks") or 0) + 1
+        if str(source) == "external":
+            state["lastExternalAt"] = now.isoformat()
+        elif str(source) == "background":
+            state["lastBackgroundAt"] = now.isoformat()
+    if ok is True:
+        state["lastSuccessAt"] = now.isoformat()
+        state["lastError"] = ""
+    elif ok is False:
+        state["lastError"] = str(error or "UNKNOWN")[:300]
+    if sent is not None:
+        state["lastSent"] = int(sent or 0)
+    if failed is not None:
+        state["lastFailed"] = int(failed or 0)
+    if items is not None:
+        state["lastItems"] = int(items or 0)
+    if duration_ms is not None:
+        state["lastDurationMs"] = int(duration_ms or 0)
+    _save_pwa_scheduler_state(state)
+    return state
+
+def _minutes_since_iso(value):
+    dt = _parse_kst_iso(value)
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now(KST) - dt).total_seconds() / 60.0)
+
 PWA_SCHEDULE_NAMES = {
     "agro": "정령왕 아그로",
     "kaira": "감시자 카이라",
@@ -9202,10 +9286,14 @@ def _pwa_push_payload(item):
     if typ in ("boss", "content"):
         name = str(item.get("boss") or item.get("content") or "AION2 콘텐츠")
         lead = int(item.get("alertMinutes") or 0)
+        remaining = int(item.get("remainingMinutes") if item.get("remainingMinutes") is not None else lead)
         when = str(item.get("time") or "")
+        late_note = ""
+        if lead and remaining < lead - 1:
+            late_note = f" · 현재 약 {remaining}분 전"
         return {
             "title": f"🐲 {name} {lead}분 전",
-            "body": f"{when} 예정 · AION2 TOOL에서 확인하세요.",
+            "body": f"{when} 예정{late_note} · AION2 TOOL에서 확인하세요.",
             "url": "/",
             "tag": "schedule-" + key,
         }
@@ -9439,10 +9527,14 @@ def _pwa_mark_maintenance_change_sent(candidate, now=None):
     return _save_boss_schedule_overrides(data)
 
 
-async def _run_pwa_push_alert_check():
+async def _run_pwa_push_alert_check(source="background"):
+    started = time.perf_counter()
+    _scheduler_stamp(source)
     if not _pwa_push_configured():
+        _scheduler_stamp(source, ok=False, duration_ms=int((time.perf_counter()-started)*1000), error="VAPID_NOT_CONFIGURED")
         return {"ok": False, "configured": False, "error": "VAPID_NOT_CONFIGURED"}
     if not _load_pwa_push_subscriptions():
+        _scheduler_stamp(source, ok=True, sent=0, failed=0, items=0, duration_ms=int((time.perf_counter()-started)*1000))
         return {"ok": True, "configured": True, "subscriptions": 0, "items": 0, "sent": 0}
 
     async with PWA_PUSH_CHECK_LOCK:
@@ -9497,6 +9589,11 @@ async def _run_pwa_push_alert_check():
                 else:
                     _pwa_alert_release_lease(PWA_PUSH_ROOM, key)
 
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _scheduler_stamp(
+            source, ok=True, sent=sent_total, failed=failed_total,
+            items=len(items), duration_ms=duration_ms
+        )
         return {
             "ok": True,
             "configured": True,
@@ -9504,6 +9601,8 @@ async def _run_pwa_push_alert_check():
             "items": len(items),
             "sent": sent_total,
             "failed": failed_total,
+            "durationMs": duration_ms,
+            "source": source,
             "results": results,
         }
 
@@ -9581,11 +9680,38 @@ async def pwa_push_public_key():
 
 @app.get("/api/push/status")
 async def pwa_push_status():
+    scheduler = _load_pwa_scheduler_state()
     return {
         "ok": True,
         "configured": _pwa_push_configured(),
         "subscriptions": len(_load_pwa_push_subscriptions()),
         "persistentStorage": AION2_STORAGE_PERSISTENT,
+        "scheduler": scheduler,
+    }
+
+
+@app.get("/api/push/diagnostics")
+async def pwa_push_diagnostics():
+    scheduler = _load_pwa_scheduler_state()
+    ext_m = _minutes_since_iso(scheduler.get("lastExternalAt"))
+    bg_m = _minutes_since_iso(scheduler.get("lastBackgroundAt"))
+    any_m = _minutes_since_iso(scheduler.get("lastCheckAt"))
+    return {
+        "ok": True,
+        "configured": _pwa_push_configured(),
+        "subscriptions": len(_load_pwa_push_subscriptions()),
+        "persistentStorage": AION2_STORAGE_PERSISTENT,
+        "dataDir": str(AION2_DATA_DIR),
+        "lastCheckMinutes": None if any_m is None else round(any_m, 1),
+        "lastExternalMinutes": None if ext_m is None else round(ext_m, 1),
+        "lastBackgroundMinutes": None if bg_m is None else round(bg_m, 1),
+        "externalCronHealthy": ext_m is not None and ext_m <= 3.0,
+        "backgroundHealthy": bg_m is not None and bg_m <= 2.5,
+        "scheduler": scheduler,
+        "recommendation": (
+            "정상" if ext_m is not None and ext_m <= 3.0
+            else "외부 1분 체크를 연결하면 Render 절전/지연에도 30분·10분 알림이 안정적입니다."
+        ),
     }
 
 
@@ -9676,7 +9802,11 @@ async def alerts_check(secret: str = ""):
     expected = str(os.getenv("ALERT_CRON_SECRET") or "").strip()
     if expected and str(secret or "") != expected:
         return JSONResponse({"ok": False, "error": "UNAUTHORIZED"}, status_code=403)
-    return await _run_pwa_push_alert_check()
+    try:
+        return await _run_pwa_push_alert_check(source="external")
+    except Exception as e:
+        _scheduler_stamp("external", ok=False, error=f"{type(e).__name__}:{str(e)[:220]}")
+        return JSONResponse({"ok": False, "error": "ALERT_CHECK_FAILED"}, status_code=500)
 
 
 async def _pwa_push_background_loop():
@@ -9684,9 +9814,9 @@ async def _pwa_push_background_loop():
     while True:
         try:
             if _pwa_push_configured() and _load_pwa_push_subscriptions():
-                await _run_pwa_push_alert_check()
-        except Exception:
-            pass
+                await _run_pwa_push_alert_check(source="background")
+        except Exception as e:
+            _scheduler_stamp("background", ok=False, error=f"{type(e).__name__}:{str(e)[:220]}")
         await asyncio.sleep(60)
 
 
