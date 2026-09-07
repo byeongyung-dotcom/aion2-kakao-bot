@@ -8048,16 +8048,201 @@ async def board_lookup(command: str):
     return result
 
 
+
+
+# =========================================================
+# Tablet PWA launcher
+# =========================================================
+PWA_HOME_HTML = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0c1120">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AION2 TOOL">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
+<title>AION2 TOOL</title>
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:dark;--bg:#0c1120;--card:#151d31;--card2:#10182a;--line:#2a3550;--text:#f4f7ff;--muted:#96a3bb;--blue:#4aa3ff;--purple:#8b78ff;--good:#48d9a7}
+html,body{margin:0;min-height:100%;background:radial-gradient(circle at 80% 0,#17234a 0,transparent 34%),var(--bg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif;color:var(--text)}
+body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+.wrap{width:min(1100px,100%);margin:0 auto;padding:22px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:13px}.logo{width:54px;height:54px;border-radius:16px;background:linear-gradient(145deg,#1d2d56,#171d33);border:1px solid #5f63da;display:grid;place-items:center;font-weight:900;font-size:21px;box-shadow:0 12px 30px #0007}
+h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px}
+.install{border:1px solid #5966a6;background:#1a2440;color:#fff;border-radius:12px;padding:11px 15px;font-weight:700;cursor:pointer}
+.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{background:linear-gradient(180deg,#161f34,#11182a);border:1px solid var(--line);border-radius:18px;padding:17px;box-shadow:0 16px 45px #0004}.card h2{font-size:16px;margin:0 0 13px}.search{display:grid;grid-template-columns:1fr 150px auto;gap:9px}input,select{width:100%;border:1px solid #34415f;background:#0d1424;color:#fff;border-radius:12px;padding:13px;font-size:16px;outline:none}input:focus,select:focus{border-color:var(--blue)}
+.primary{border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;border-radius:12px;padding:0 17px;font-weight:800;font-size:15px;cursor:pointer}.actions{display:flex;gap:9px;margin-top:10px}.ghost{flex:1;border:1px solid #3a4868;background:#111a2e;color:#eaf0ff;border-radius:11px;padding:11px;font-weight:700;cursor:pointer}
+.section{margin-top:16px}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.btn{border:1px solid #34415e;background:#121b2e;color:#eef3ff;border-radius:12px;padding:13px 8px;font-size:14px;font-weight:750;cursor:pointer;min-height:48px}.btn:active,.ghost:active,.primary:active{transform:scale(.985)}.btn.feature{border-color:#4d5b93;background:#182341}.btn.news{border-color:#405f64;background:#13282d}
+.result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
+.footer{text-align:center;color:#6f7e99;font-size:11px;padding:18px 0 3px}
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#202a44;border:1px solid #4a587c;border-radius:12px;padding:11px 15px;box-shadow:0 12px 40px #0008;display:none;z-index:50}
+@media(max-width:800px){.wrap{padding:15px}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
+@media(max-width:480px){.buttons{grid-template-columns:repeat(2,1fr)}h1{font-size:21px}.logo{width:48px;height:48px}.sub{max-width:230px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 전용 · 기존 서버 기능 그대로</div></div></div>
+    <button id="installBtn" class="install">앱 설치</button>
+  </div>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>⚔️ 캐릭터</h2>
+        <div class="search">
+          <input id="charName" placeholder="캐릭터명" autocomplete="off" value="윤이">
+          <input id="serverName" placeholder="서버" value="지켈" autocomplete="off">
+          <button class="primary" id="detailBtn">상세 조회</button>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="rankingBtn">🏆 랭킹 조회</button>
+          <button class="ghost" onclick="location.href='/compare'">⚖️ 캐릭터 비교</button>
+        </div>
+      </div>
+
+      <div class="card section">
+        <h2>🐲 필드보스 / 콘텐츠</h2>
+        <div class="buttons">
+          <button class="btn feature" data-cmd="필보">필보 전체</button>
+          <button class="btn" data-cmd="아그로">아그로</button>
+          <button class="btn" data-cmd="카이라">카이라</button>
+          <button class="btn" data-cmd="나흐마">나흐마</button>
+          <button class="btn" data-cmd="어비스">어비스</button>
+          <button class="btn" data-cmd="시공">시공</button>
+          <button class="btn" data-cmd="균열">균열</button>
+          <button class="btn" data-cmd="아티">아티</button>
+        </div>
+      </div>
+
+      <div class="card section">
+        <h2>📢 소식 / 파티편성</h2>
+        <div class="buttons">
+          <button class="btn news" data-cmd="공지">공지</button>
+          <button class="btn news" data-cmd="CM">CM</button>
+          <button class="btn news" data-cmd="업데이트">업데이트</button>
+          <button class="btn" data-open="/party-card/무스펠">무스펠</button>
+          <button class="btn" data-open="/party-card/성역3">성역3</button>
+          <button class="btn" data-open="/party-card/성역4">성역4 / 비탄</button>
+          <button class="btn" data-cmd="인원">인원표</button>
+          <button class="btn" data-cmd="도움">전체 기능</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:13px"><h2 style="margin:0">결과</h2><span class="pill"><span class="dot"></span>서버 연결</span></div>
+      <div id="result" class="result">버튼을 누르면 여기에 결과가 표시됩니다.</div>
+      <div id="status" class="status">AION2 TOOL · Tablet PWA</div>
+    </div>
+  </div>
+  <div class="footer">메신저 없이 직접 실행 · 데이터 조회는 기존 AION2 서버 로직 사용</div>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+const $=id=>document.getElementById(id), result=$('result'), statusEl=$('status');
+function toast(msg){const el=$('toast');el.textContent=msg;el.style.display='block';setTimeout(()=>el.style.display='none',2400)}
+function renderText(text){
+  result.textContent='';
+  const re=/(https?:\/\/[^\s]+)/g; let pos=0;
+  for(const m of text.matchAll(re)){
+    result.append(document.createTextNode(text.slice(pos,m.index)));
+    const a=document.createElement('a'); a.href=m[0]; a.textContent=m[0]; a.target='_blank'; a.rel='noopener'; result.append(a);
+    pos=m.index+m[0].length;
+  }
+  result.append(document.createTextNode(text.slice(pos)));
+}
+async function run(cmd){
+  statusEl.textContent='조회 중…'; result.textContent='불러오는 중…';
+  try{
+    const r=await fetch('/openchat?msg='+encodeURIComponent('!'+cmd)+'&room='+encodeURIComponent('AION2 TOOL'),{cache:'no-store'});
+    const t=await r.text(); renderText(t); statusEl.textContent='완료 · '+new Date().toLocaleTimeString('ko-KR');
+  }catch(e){result.textContent='조회 실패\n'+(e?.message||e);statusEl.textContent='연결 오류'}
+}
+document.querySelectorAll('[data-cmd]').forEach(b=>b.addEventListener('click',()=>run(b.dataset.cmd)));
+document.querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',()=>location.href=b.dataset.open));
+$('detailBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n||!s)return toast('캐릭터명과 서버를 입력해 주세요.');location.href='/detail?name='+encodeURIComponent(n)+'&server='+encodeURIComponent(s)};
+$('rankingBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n)return toast('캐릭터명을 입력해 주세요.');run('랭킹 '+n+(s||''))};
+['charName','serverName'].forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter')$('detailBtn').click()}));
+let deferredPrompt=null;const installBtn=$('installBtn');
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
+installBtn.onclick=async()=>{if(deferredPrompt){deferredPrompt.prompt();await deferredPrompt.userChoice;deferredPrompt=null}else{toast('Chrome 메뉴(⋮) → 앱 설치 또는 홈 화면에 추가')}};
+window.addEventListener('appinstalled',()=>{installBtn.textContent='설치됨';toast('AION2 TOOL 설치 완료')});
+if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}))}
+</script>
+</body>
+</html>"""
+
+PWA_MANIFEST = {
+    "name": "AION2 TOOL",
+    "short_name": "AION2",
+    "description": "AION2 character, ranking, field boss and party tool",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#0c1120",
+    "theme_color": "#0c1120",
+    "orientation": "any",
+    "icons": [
+        {"src": "/pwa/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+        {"src": "/pwa/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+    ]
+}
+
+PWA_SW = r"""const CACHE='aion2-tool-shell-v1';
+const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});
+self.addEventListener('fetch',e=>{
+  if(e.request.method!=='GET')return;
+  const u=new URL(e.request.url);
+  if(u.origin!==location.origin)return;
+  if(u.pathname.startsWith('/api/')||u.pathname.startsWith('/openchat')||u.pathname.startsWith('/c/')||u.pathname.startsWith('/detail'))return;
+  if(e.request.mode==='navigate'){
+    e.respondWith(fetch(e.request).catch(()=>caches.match('/')));return;
+  }
+  e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
+});"""
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest():
+    return JSONResponse(PWA_MANIFEST, media_type="application/manifest+json", headers={"Cache-Control": "no-cache"})
+
+@app.get("/sw.js")
+async def pwa_service_worker():
+    return Response(PWA_SW, media_type="application/javascript; charset=utf-8", headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+@app.get("/pwa/icon-{size}.png")
+async def pwa_icon(size: int):
+    if size not in (192, 512):
+        return Response(status_code=404)
+    icon_path = Path(__file__).resolve().parent / "pwa_assets" / f"icon-{size}.png"
+    try:
+        return Response(icon_path.read_bytes(), media_type="image/png", headers={"Cache-Control": "public, max-age=604800"})
+    except Exception:
+        return Response(status_code=404)
+
+
 # =========================================================
 # Routes
 # =========================================================
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
+    return HTMLResponse(PWA_HOME_HTML, media_type="text/html; charset=utf-8", headers={"Cache-Control": "no-cache"})
+
+@app.get("/api/status")
+async def api_status():
     return {
         "ok": True,
-        "service": "AION2 Server v23 FullServerFix",
+        "service": "AION2 Server v23 FullServerFix + Tablet PWA",
         "server": "전 서버 캐릭터 검색 / 지켈 필드보스",
         "character": "Own DB + NotMeter refresh",
         "fieldBoss": "NotMeter public cache",
