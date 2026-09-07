@@ -8053,7 +8053,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V8 PRO"
+PWA_APP_VERSION = "V9 FINAL"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -8094,8 +8094,8 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 <body>
 <div class="wrap">
   <div class="top">
-    <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 전용 · 기존 서버 기능 그대로</div></div></div>
-    <div class="topactions"><span id="versionBadge" class="versionbadge">V8 PRO</span><button id="updateBtn" class="updatebtn">새 버전 적용</button><button id="installBtn" class="install">앱 설치</button></div>
+    <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 + 카카오 통합 · AION2 운영 도구</div></div></div>
+    <div class="topactions"><span id="versionBadge" class="versionbadge">V9 FINAL</span><button id="updateBtn" class="updatebtn">새 버전 적용</button><button id="installBtn" class="install">앱 설치</button></div>
   </div>
 
   <div class="dashboard">
@@ -8120,6 +8120,11 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
       <div class="dashtitle">🔔 이 태블릿 알림</div>
       <div id="dashPush" class="dashvalue">확인 중…</div>
       <div id="dashPushSub" class="dashsub">푸시 구독 상태</div>
+    </div>
+    <div id="dashKakaoCard" class="dashitem">
+      <div class="dashtitle">💬 카카오 연동</div>
+      <div id="dashKakao" class="dashvalue">확인 중…</div>
+      <div id="dashKakaoSub" class="dashsub">카카오 폴링 상태</div>
     </div>
     <div id="dashRecent" class="dashitem">
       <div class="dashtitle">🧾 최근 알림</div>
@@ -8259,7 +8264,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
       <div id="status" class="status">AION2 TOOL · Tablet PWA</div>
     </div>
   </div>
-  <div class="footer">메신저 없이 직접 실행 · 데이터 조회는 기존 AION2 서버 로직 사용</div>
+  <div class="footer">PWA 직접 실행 + 카카오 연동 · 동일 AION2 서버/알림 엔진 사용</div>
 </div>
 <div id="toast" class="toast"></div>
 <script>
@@ -8372,10 +8377,11 @@ renderFavBossChips();
 
 async function refreshDashboard(){
   try{
-    const [nextRes,healthRes,historyRes]=await Promise.all([
+    const [nextRes,healthRes,historyRes,kakaoRes]=await Promise.all([
       fetch('/api/push/next',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
       fetch('/api/push/diagnostics',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
-      fetch('/api/push/history',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}))
+      fetch('/api/push/history',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
+      fetch('/api/kakao/status',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}))
     ]);
     latestNextItems=(nextRes.items||[]).map(x=>Object.assign({},x,{targetTs:x.targetIso?new Date(x.targetIso).getTime():Date.now()+(Number(x.minutes)||0)*60000}));
     const next=latestNextItems.find(x=>x.enabled!==false)||latestNextItems[0];
@@ -8394,6 +8400,10 @@ async function refreshDashboard(){
     $('dashHealth').className='dashvalue '+(ok?'dashgood':'dashwarn');
     const ext=healthRes.lastExternalMinutes;
     $('dashHealthSub').textContent=(ext==null?'외부 체크 기록 없음':'외부 체크 '+ext+'분 전')+' · 등록 '+(healthRes.subscriptions||0)+'대';
+    const activeKakao=Number(kakaoRes.activeRooms||0), totalKakao=Number(kakaoRes.rooms||0);
+    if(activeKakao>0){$('dashKakao').textContent='연결';$('dashKakao').className='dashvalue dashgood';$('dashKakaoSub').textContent='활성 '+activeKakao+'방 · 등록 '+totalKakao+'방';}
+    else if(totalKakao>0){$('dashKakao').textContent='대기';$('dashKakao').className='dashvalue dashwarn';$('dashKakaoSub').textContent='등록 '+totalKakao+'방 · 폰 봇 폴링 확인';}
+    else{$('dashKakao').textContent='미등록';$('dashKakao').className='dashvalue dashwarn';$('dashKakaoSub').textContent='카카오 방에서 !로컬확인 실행';}
     const recent=(historyRes.items||[])[0];
     if(recent){$('dashRecentTitle').textContent=recent.title||'알림';$('dashRecentTime').textContent=(recent.time||'')+' · '+String(recent.body||'').slice(0,35)}
     else{$('dashRecentTitle').textContent='아직 없음';$('dashRecentTime').textContent='첫 자동 알림 전입니다.'}
@@ -8403,6 +8413,17 @@ $('dashNext').onclick=()=>showNextAlerts();
 $('dashHealthCard').onclick=()=>showPushHealth();
 $('dashRecent').onclick=()=>showPushHistory();
 $('dashPushCard').onclick=()=>{$('notifySettingsBox').classList.add('open');$('notifySettingsBox').scrollIntoView({behavior:'smooth',block:'center'});};
+$('dashKakaoCard').onclick=()=>showKakaoStatus();
+async function showKakaoStatus(){
+  statusEl.textContent='카카오 연동 상태 확인 중…';
+  try{
+    const d=await fetch('/api/kakao/status',{cache:'no-store'}).then(r=>r.json());
+    const lines=['💬 카카오 연동 상태','','등록 방: '+(d.rooms||0),'최근 60초 활성 방: '+(d.activeRooms||0),'기본 일정 알림: 30분 전 / 10분 전','공지 자동알림: 점검·라이브','CM / 업데이트: 새 글 전체','아그로: 점검 시간 변경 시 1회 알림',''];
+    (d.roomStates||[]).slice(0,8).forEach(x=>lines.push('• '+(x.alias||x.room||'방')+' · '+(x.active?'연결':'대기')+(x.lastPollAt?' · '+x.lastPollAt:'')));
+    lines.push('','카카오 명령: !봇상태 / !알림진단 / !알림테스트 / !알림기본 / !앱');
+    renderText(lines.join('\n')); statusEl.textContent='카카오 상태 확인 완료';
+  }catch(e){renderText('카카오 상태 조회 실패\n'+(e?.message||e));statusEl.textContent='조회 오류';}
+}
 renderFavoriteCharacter();
 
 function b64ToU8(base64String){
@@ -8563,7 +8584,7 @@ async function fullSelfCheck(){
 async function backupSettings(){
   try{
     const prefs=await fetch('/api/push/settings',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
-    const data={format:'AION2_TOOL_BACKUP_V1',createdAt:new Date().toISOString(),appVersion:'V8 PRO',favoriteCharacter:getFavoriteCharacter(),favoriteBosses:getFavoriteBosses(),pushSettings:prefs.settings||null};
+    const data={format:'AION2_TOOL_BACKUP_V1',createdAt:new Date().toISOString(),appVersion:'V9 FINAL',favoriteCharacter:getFavoriteCharacter(),favoriteBosses:getFavoriteBosses(),pushSettings:prefs.settings||null};
     const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
     a.href=url;a.download='AION2_TOOL_settings_'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('설정 백업 파일을 만들었습니다.');
   }catch(e){toast('설정 백업 실패');}
@@ -8706,7 +8727,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v8-pro"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v9-final"}
 
 
 @app.get("/manifest.webmanifest")
@@ -8826,6 +8847,12 @@ def _default_openchat_delivery_state():
         "boardPending": [],
         "sentKeys": [],
         "leases": {},
+        "lastPollAt": "",
+        "lastAlias": "",
+        "lastAckAt": "",
+        "maintenanceSourceId": "",
+        "maintenanceAnchor": "",
+        "maintenancePending": None,
     }
 
 def _default_openchat_alert_state():
@@ -8867,6 +8894,11 @@ def _normalize_openchat_delivery(raw):
             if str(key) and expiry_f > now_epoch - 60:
                 clean_leases[str(key)] = expiry_f
         out["leases"] = clean_leases
+    for field in ("lastPollAt", "lastAlias", "lastAckAt", "maintenanceSourceId", "maintenanceAnchor"):
+        if field in raw:
+            out[field] = str(raw.get(field) or "")
+    if isinstance(raw.get("maintenancePending"), dict):
+        out["maintenancePending"] = dict(raw.get("maintenancePending") or {})
     return out
 
 def _load_openchat_alert_state():
@@ -9130,8 +9162,59 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             return {"ok": True, "enabled": False, "room": room_key, "baseline": False, "items": []}
 
         _, delivery = _openchat_get_delivery(state, room)
+        delivery["lastPollAt"] = now.isoformat()
+        delivery["lastAlias"] = _openchat_room_key(room_alias) or room_key
         first_run = not delivery.get("initialized")
         items = []
+
+        # Maintenance-driven Agro change, kept pending until phone ACK.
+        try:
+            maint = _persisted_official_agro_info()
+            current_source = str(maint.get("sourceId") or "")
+            current_anchor = maint.get("anchor")
+            seen_source = str(delivery.get("maintenanceSourceId") or "")
+            seen_anchor = _parse_kst_iso(delivery.get("maintenanceAnchor"))
+            pending = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
+            if not seen_source and current_source and current_anchor is not None:
+                delivery["maintenanceSourceId"] = current_source
+                delivery["maintenanceAnchor"] = current_anchor.astimezone(KST).isoformat()
+            elif current_source and current_anchor is not None and current_source != seen_source:
+                if not pending or str(pending.get("sourceId") or "") != current_source:
+                    delta = _maintenance_clock_delta_minutes(seen_anchor, current_anchor) if seen_anchor else 0
+                    if delta:
+                        nxt = next_agro_from_anchor(current_anchor, now)
+                        pending = {
+                            "key": "MAINT|" + re.sub(r"[^0-9A-Za-z_-]", "", current_source)[:100],
+                            "sourceId": current_source,
+                            "anchor": current_anchor.astimezone(KST).isoformat(),
+                            "oldTime": seen_anchor.strftime("%H:%M") if seen_anchor else "기존",
+                            "newTime": current_anchor.strftime("%H:%M"),
+                            "shiftMinutes": int(delta),
+                            "nextAgro": nxt.strftime("%m/%d %H:%M") if nxt else "",
+                            "title": str(maint.get("sourceTitle") or "점검 일정 변경"),
+                        }
+                        delivery["maintenancePending"] = pending
+                    else:
+                        delivery["maintenanceSourceId"] = current_source
+                        delivery["maintenanceAnchor"] = current_anchor.astimezone(KST).isoformat()
+                        delivery["maintenancePending"] = None
+            pending = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
+            if pending and str(pending.get("key") or ""):
+                shift = int(pending.get("shiftMinutes") or 0)
+                sign = "+" if shift > 0 else ""
+                items.append({
+                    "type": "maintenance_change",
+                    "title": "아그로 시간 변경",
+                    "oldTime": str(pending.get("oldTime") or ""),
+                    "newTime": str(pending.get("newTime") or ""),
+                    "shiftMinutes": shift,
+                    "shiftText": f"{sign}{shift}분",
+                    "nextAgro": str(pending.get("nextAgro") or ""),
+                    "noticeTitle": str(pending.get("title") or ""),
+                    "key": str(pending.get("key") or ""),
+                })
+        except Exception:
+            pass
 
         # Test alerts stay retryable for 5 minutes, but only the newest one
         # for this room is ever exposed. This also cleans old duplicate state.
@@ -9344,6 +9427,12 @@ async def openchat_alert_ack(room: str = "", key: str = "", room_alias: str = ""
             [str(x) for x in (delivery.get("sentKeys") or []) if str(x)] + [alert_key]
         ))[-1000:]
         delivery["sentKeys"] = sent_keys
+        delivery["lastAckAt"] = datetime.now(KST).isoformat()
+        pending_maintenance = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
+        if pending_maintenance and str(pending_maintenance.get("key") or "") == alert_key:
+            delivery["maintenanceSourceId"] = str(pending_maintenance.get("sourceId") or "")
+            delivery["maintenanceAnchor"] = str(pending_maintenance.get("anchor") or "")
+            delivery["maintenancePending"] = None
         leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
         leases.pop(alert_key, None)
         delivery["leases"] = leases
@@ -9358,6 +9447,37 @@ async def openchat_alert_ack(room: str = "", key: str = "", room_alias: str = ""
         state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
         _save_openchat_alert_state(state)
     return {"ok": True, "room": room_key, "key": alert_key, "acked": True}
+
+
+@app.get("/api/kakao/status")
+async def kakao_bridge_status():
+    state = _load_openchat_alert_state()
+    deliveries = state.get("deliveries") if isinstance(state.get("deliveries"), dict) else {}
+    room_states = []
+    now = datetime.now(KST)
+    for key, raw in deliveries.items():
+        if key == "__global__":
+            continue
+        d = _normalize_openchat_delivery(raw)
+        last = _parse_kst_iso(d.get("lastPollAt"))
+        age = None
+        active = False
+        if last is not None:
+            age = max(0.0, (now - last).total_seconds())
+            active = age <= 60
+        room_states.append({
+            "room": str(key),
+            "alias": str(d.get("lastAlias") or key),
+            "enabled": _openchat_alert_enabled(state, key),
+            "active": active,
+            "lastPollAgeSeconds": round(age, 1) if age is not None else None,
+            "lastPollAt": last.strftime("%H:%M:%S") if last is not None else "",
+            "lastAckAt": str(d.get("lastAckAt") or ""),
+        })
+    room_states.sort(key=lambda x: (not x["active"], x["alias"]))
+    return {"ok": True, "version": PWA_APP_VERSION, "rooms": len(room_states),
+            "activeRooms": sum(1 for x in room_states if x["active"]),
+            "defaultLeads": list(DEFAULT_SCHEDULE_ALERT_LEADS), "roomStates": room_states[:30]}
 
 
 # =========================================================
@@ -10958,11 +11078,45 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             "⚔️ 콘텐츠\n!시공 / !균열 / !아티\n\n"
             "📢 소식\n!공지 / !CM / !업데이트\n\n"
             "👥 파티편성\n!무스펠 / !성역3 / !성역4 / !비탄\n\n"
-            "👥 기타\n!인원\n!비교\n\n"
+            "👥 기타\n!인원\n!비교\n!앱\n\n"
             "🔔 알림\n!알림켜기 / !알림끄기 / !알림상태\n"
-            "!방이름 / !알림진단 / !알림테스트\n"
+            "!방이름 / !봇상태 / !알림진단 / !알림테스트 / !알림기본\n"
+            "기본: 모든 일정 30분 전 + 10분 전\n"
             "시간 수정: !아그로 06:00 / !시공 20:00\n"
             "알림 수정: !아그로 25분전 / !시공 25분전 10분전",
+            media_type="text/plain; charset=utf-8",
+        )
+
+    if body == "앱":
+        return PlainTextResponse(
+            "📱 AION2 TOOL\nhttps://aion2-kakao-bot.onrender.com",
+            media_type="text/plain; charset=utf-8",
+        )
+
+    if body == "봇상태":
+        state = _load_openchat_alert_state()
+        _key, delivery = _openchat_get_delivery(state, room)
+        last = _parse_kst_iso(delivery.get("lastPollAt"))
+        age = None if last is None else max(0, int((datetime.now(KST) - last).total_seconds()))
+        leads = _get_schedule_alert_leads("아그로", room)
+        text = (
+            "💬 AION2 카카오 연동\n\n"
+            f"방: {display_room or _openchat_room_key(room) or '(미확인)'}\n"
+            f"알림: {'ON' if _openchat_alert_enabled(state, room) else 'OFF'}\n"
+            f"자동 폴링: {'정상' if age is not None and age <= 60 else '확인 필요'}"
+            + (f" ({age}초 전)" if age is not None else "") + "\n"
+            f"일정 알림: {' / '.join(str(x)+'분 전' for x in leads)}\n"
+            "점검 아그로 변경: 자동 1회 알림\n"
+            f"서버: {PWA_APP_VERSION}"
+        )
+        return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+
+    if body == "알림기본":
+        _set_openchat_alert_enabled(True, room)
+        for _name in ("아그로", "카이라", "나흐마", "어비스", "시공", "균열", "아티", "필드보스"):
+            _set_schedule_alert_leads(_name, [30, 10], room)
+        return PlainTextResponse(
+            f"✅ [{display_room or '현재 방'}] 알림 기본값 적용\n모든 일정: 30분 전 + 10분 전\n점검 아그로 변경: 자동",
             media_type="text/plain; charset=utf-8",
         )
 
@@ -11007,7 +11161,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
 
     if body in ("알림켜기", "알림끄기", "알림상태", "테스트"):
         if body == "테스트":
-            text = "✅ AION2 v57 서버 정상"
+            text = f"✅ AION2 {PWA_APP_VERSION} 서버 정상"
         elif body == "알림켜기":
             _enabled, room_key = _set_openchat_alert_enabled(True, room)
             target = f"[{display_room}] " if display_room else ""
