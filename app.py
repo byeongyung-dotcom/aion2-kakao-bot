@@ -8053,7 +8053,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V7"
+PWA_APP_VERSION = "V8 PRO"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -8084,6 +8084,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 .result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
 .notifyrow{display:flex;align-items:center;justify-content:space-between;gap:12px}.notifystate{display:flex;align-items:center;gap:8px;font-size:13px;color:#c9d3e8}.notifydot{width:9px;height:9px;border-radius:50%;background:#6b7280;box-shadow:none}.notifydot.on{background:var(--good);box-shadow:0 0 12px var(--good)}.notifyactions{display:flex;gap:8px;flex-wrap:wrap}.notifybtn{border:1px solid #3d4b6c;background:#121b2f;color:#eef3ff;border-radius:11px;padding:10px 13px;font-weight:750;cursor:pointer}.notifybtn.on{border-color:#2f8f74;background:#123229}.notifybtn.test{border-color:#5365a0;background:#182342}.notifybtn.off{border-color:#70454d;background:#2b171b}.notifyhelp{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5}
 .notifytools{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.notifytools .notifybtn{padding:8px 11px;font-size:12px}.settingsbox{display:none;margin-top:12px;padding:13px;border:1px solid #2d3a58;border-radius:13px;background:#0d1525}.settingsbox.open{display:block}.settingshead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.settingshead b{font-size:13px}.settinglabel{font-size:12px;color:#aebbd1;margin:11px 0 7px}.checkgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.checkchip{display:flex;align-items:center;gap:7px;border:1px solid #34415e;background:#121b2e;border-radius:10px;padding:9px 10px;font-size:12px;color:#eef3ff}.checkchip input{width:auto;margin:0;accent-color:#5a8cff}.saveprefs{width:100%;margin-top:12px;border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:#fff;border-radius:11px;padding:11px;font-weight:800}.nextline{font-size:11px;color:#8090aa;margin-top:8px}@media(max-width:600px){.checkgrid{grid-template-columns:repeat(2,1fr)}}
+.timelinecard{margin-bottom:16px}.timelinehead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px}.timelinehead h2{margin:0}.timelineactions{display:flex;gap:6px}.tinybtn{border:1px solid #354363;background:#10192b;color:#dbe5f8;border-radius:9px;padding:7px 10px;font-size:10px;font-weight:800;cursor:pointer}.timeline{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.timelineitem{border:1px solid #2e3b59;background:#0e1728;border-radius:12px;padding:10px 11px;cursor:pointer}.timelineitem.off{opacity:.48}.timelinetop{display:flex;justify-content:space-between;gap:8px;align-items:center}.timelinename{font-size:12px;font-weight:850;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timelineclock{font-size:10px;color:#8fa0bc}.timelinecount{font-size:15px;font-weight:900;margin-top:7px;font-variant-numeric:tabular-nums}.timelinelead{font-size:9px;color:#7f8da8;margin-top:4px}.backupinput{display:none}@media(max-width:800px){.timeline{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.timeline{grid-template-columns:1fr 1fr}.timelineitem{padding:9px}.timelinecount{font-size:13px}}
 .footer{text-align:center;color:#6f7e99;font-size:11px;padding:18px 0 3px}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#202a44;border:1px solid #4a587c;border-radius:12px;padding:11px 15px;box-shadow:0 12px 40px #0008;display:none;z-index:50}
 @media(max-width:800px){.wrap{padding:15px}.dashboard{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
@@ -8094,7 +8095,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 <div class="wrap">
   <div class="top">
     <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 전용 · 기존 서버 기능 그대로</div></div></div>
-    <div class="topactions"><span id="versionBadge" class="versionbadge">V7</span><button id="updateBtn" class="updatebtn">새 버전 적용</button><button id="installBtn" class="install">앱 설치</button></div>
+    <div class="topactions"><span id="versionBadge" class="versionbadge">V8 PRO</span><button id="updateBtn" class="updatebtn">새 버전 적용</button><button id="installBtn" class="install">앱 설치</button></div>
   </div>
 
   <div class="dashboard">
@@ -8130,6 +8131,11 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
       <div id="dashFav" class="dashvalue">윤이 · 지켈</div>
       <div class="favtools"><button id="favSaveBtn" class="favmini">현재 저장</button><button id="favOpenBtn" class="favmini">바로 조회</button></div>
     </div>
+  </div>
+
+  <div class="card timelinecard">
+    <div class="timelinehead"><h2>📅 다가오는 일정</h2><div class="timelineactions"><button id="timelineRefreshBtn" class="tinybtn">새로고침</button></div></div>
+    <div id="timelineList" class="timeline"><div class="timelineitem"><div class="timelinename">일정 불러오는 중…</div></div></div>
   </div>
 
   <div class="grid">
@@ -8168,6 +8174,10 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button id="test30Btn" class="notifybtn test">30분 테스트</button>
           <button id="test10Btn" class="notifybtn test">10분 테스트</button>
           <button id="testAgroBtn" class="notifybtn test">아그로 변경 테스트</button>
+          <button id="fullCheckBtn" class="notifybtn">✅ 전체 자가진단</button>
+          <button id="backupBtn" class="notifybtn">💾 설정 백업</button>
+          <button id="restoreBtn" class="notifybtn">♻️ 설정 복원</button>
+          <input id="restoreFile" class="backupinput" type="file" accept="application/json,.json">
         </div>
         <div id="notifySettingsBox" class="settingsbox">
           <div class="settingshead"><b>알림 세부 설정</b><span style="font-size:11px;color:#7f8da8">이 태블릿용 PWA 설정</span></div>
@@ -8293,6 +8303,7 @@ const BOSS_META={
 let latestNextItems=[];
 let dashNextTargetIso='';
 let dashFavBossTargetIso='';
+let timelineRows=[];
 let dashFavBossKey='';
 function scheduleKeyFromName(name){for(const [k,v] of Object.entries(BOSS_META)){if(v.name===name)return k}return ''}
 function getFavoriteBosses(){
@@ -8322,9 +8333,21 @@ function updateFavoriteBossDashboard(){
   dashFavBossKey=scheduleKeyFromName(x.name);dashFavBossTargetIso=x.targetIso||'';$('dashFavBossName').textContent=BOSS_META[dashFavBossKey]?.short||x.name;
   $('dashFavBossTime').textContent=(x.time||'')+(dashFavBossTargetIso?' · '+formatCountdown(dashFavBossTargetIso):'');
 }
+function renderTimeline(){
+  const box=$('timelineList'); if(!box)return;
+  timelineRows=latestNextItems.slice().sort((a,b)=>(a.targetTs||0)-(b.targetTs||0)).slice(0,6);
+  if(!timelineRows.length){box.innerHTML='<div class="timelineitem"><div class="timelinename">예정된 일정 없음</div></div>';return;}
+  box.innerHTML=timelineRows.map((x,i)=>{
+    const key=x.key||scheduleKeyFromName(x.name);
+    const leads=(x.leads||[]).map(v=>v+'분').join('·');
+    return '<div class="timelineitem '+(x.enabled===false?'off':'')+'" data-ti="'+i+'" data-key="'+(key||'')+'"><div class="timelinetop"><div class="timelinename">'+(x.enabled===false?'🔕 ':'')+(BOSS_META[key]?.short||x.name||'일정')+'</div><div class="timelineclock">'+(x.time||'')+'</div></div><div class="timelinecount" data-target="'+(x.targetIso||'')+'">'+formatCountdown(x.targetIso||'')+'</div><div class="timelinelead">'+(leads?('알림 '+leads):'알림 설정 없음')+'</div></div>';
+  }).join('');
+  box.querySelectorAll('[data-ti]').forEach(el=>el.onclick=()=>{const x=timelineRows[Number(el.dataset.ti)||0];const key=el.dataset.key||scheduleKeyFromName(x?.name);if(BOSS_META[key])run(BOSS_META[key].cmd);else showNextAlerts();});
+}
 function tickDashboardCountdowns(){
   if(dashNextTargetIso){const x=latestNextItems.find(v=>v.targetIso===dashNextTargetIso);$('dashNextTime').textContent=(x?.time||'')+' · '+formatCountdown(dashNextTargetIso)+' 후'+((x?.leads||[]).length?' · '+x.leads.map(v=>v+'분 전').join(' / '):'')}
   if(dashFavBossTargetIso){const x=latestNextItems.find(v=>v.targetIso===dashFavBossTargetIso);$('dashFavBossTime').textContent=(x?.time||'')+' · '+formatCountdown(dashFavBossTargetIso)+' 후'}
+  document.querySelectorAll('.timelinecount[data-target]').forEach(el=>{el.textContent=formatCountdown(el.dataset.target)+' 후';});
 }
 
 function getFavoriteCharacter(){
@@ -8365,6 +8388,7 @@ async function refreshDashboard(){
       dashNextTargetIso='';$('dashNextName').textContent='예정 없음';$('dashNextTime').textContent='현재 예정된 알림 일정이 없습니다.';
     }
     updateFavoriteBossDashboard();
+    renderTimeline();
     const ok=!!healthRes.externalCronHealthy;
     $('dashHealth').textContent=ok?'정상 감시':'점검 필요';
     $('dashHealth').className='dashvalue '+(ok?'dashgood':'dashwarn');
@@ -8515,6 +8539,50 @@ async function sendScenarioTest(kind){
     toast(label+' 테스트 알림을 보냈습니다.');
   }catch(e){toast('시나리오 테스트 실패: '+(e?.message||e));}
 }
+async function fullSelfCheck(){
+  statusEl.textContent='전체 자가진단 중…';
+  try{
+    const [v,d,s]=await Promise.all([
+      fetch('/api/app/version',{cache:'no-store'}).then(r=>r.json()),
+      fetch('/api/push/diagnostics',{cache:'no-store'}).then(r=>r.json()),
+      getPushSubscription().catch(()=>null)
+    ]);
+    const perm=('Notification' in window)?Notification.permission:'unsupported';
+    let t='✅ AION2 TOOL 전체 자가진단\n\n';
+    t+='앱 버전 : '+(v.version||'?')+'\n';
+    t+='푸시 서버 : '+(d.configured?'정상':'설정 필요')+'\n';
+    t+='이 태블릿 권한 : '+perm+'\n';
+    t+='푸시 구독 : '+(s?'등록됨':'없음')+'\n';
+    t+='cron 1분 체크 : '+(d.externalCronHealthy?'정상':'점검 필요')+(d.lastExternalMinutes==null?'':' · '+d.lastExternalMinutes+'분 전')+'\n';
+    t+='등록 기기 : '+(d.subscriptions||0)+'대\n';
+    t+='최근 체크 오류 : '+((d.scheduler||{}).lastError||'없음')+'\n\n';
+    t+=(d.configured&&s&&d.externalCronHealthy?'🟢 자동알림 시스템 정상':'🟡 위 항목 중 점검 필요');
+    renderText(t);statusEl.textContent='자가진단 완료';
+  }catch(e){renderText('자가진단 실패\n'+(e?.message||e));statusEl.textContent='자가진단 오류';}
+}
+async function backupSettings(){
+  try{
+    const prefs=await fetch('/api/push/settings',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
+    const data={format:'AION2_TOOL_BACKUP_V1',createdAt:new Date().toISOString(),appVersion:'V8 PRO',favoriteCharacter:getFavoriteCharacter(),favoriteBosses:getFavoriteBosses(),pushSettings:prefs.settings||null};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download='AION2_TOOL_settings_'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('설정 백업 파일을 만들었습니다.');
+  }catch(e){toast('설정 백업 실패');}
+}
+async function restoreSettingsFile(file){
+  try{
+    const data=JSON.parse(await file.text());if(data.format!=='AION2_TOOL_BACKUP_V1')throw new Error('지원하지 않는 백업 파일');
+    if(data.favoriteCharacter?.name&&data.favoriteCharacter?.server)localStorage.setItem(FAV_CHARACTER_KEY,JSON.stringify(data.favoriteCharacter));
+    if(Array.isArray(data.favoriteBosses))localStorage.setItem(FAV_BOSS_KEY,JSON.stringify(data.favoriteBosses.slice(0,4)));
+    if(data.pushSettings){const r=await fetch('/api/push/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data.pushSettings)});if(!r.ok)throw new Error('알림 설정 복원 실패');}
+    renderFavoriteCharacter();renderFavBossChips();renderFavBossChecks();await loadNotifyPrefs();await refreshDashboard();toast('설정을 복원했습니다.');
+  }catch(e){toast('복원 실패: '+(e?.message||e));}
+}
+$('fullCheckBtn').onclick=fullSelfCheck;
+$('backupBtn').onclick=backupSettings;
+$('restoreBtn').onclick=()=>$('restoreFile').click();
+$('restoreFile').onchange=e=>{const f=e.target.files?.[0];if(f)restoreSettingsFile(f);e.target.value='';};
+$('timelineRefreshBtn').onclick=async()=>{await refreshDashboard();toast('일정을 새로고침했습니다.');};
+
 async function disablePush(){
   try{
     const sub=await getPushSubscription();
@@ -8532,8 +8600,8 @@ $('notifyOffBtn').onclick=disablePush;
 $('test30Btn').onclick=()=>sendScenarioTest('lead30');
 $('test10Btn').onclick=()=>sendScenarioTest('lead10');
 $('testAgroBtn').onclick=()=>sendScenarioTest('agrochange');
-window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100);setTimeout(renderFavBossChecks,1200)});
-setInterval(refreshDashboard,60000);
+window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100);setTimeout(renderFavBossChecks,1200);setTimeout(()=>{const q=new URLSearchParams(location.search).get('cmd');if(q){run(q);history.replaceState({},'',location.pathname);}},1350)});
+setInterval(refreshDashboard,30000);
 setInterval(tickDashboardCountdowns,1000);
 
 let deferredPrompt=null;const installBtn=$('installBtn');
@@ -8592,10 +8660,13 @@ PWA_MANIFEST = {
     ]
 }
 
-PWA_SW = r"""const CACHE='aion2-tool-shell-v7';
+PWA_SW = r"""const CACHE='aion2-tool-shell-v8-pro';
 const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
-self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
+async function registerExistingSubscription(){try{const sub=await self.registration.pushManager.getSubscription();if(sub)await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:'Galaxy Tablet PWA · SW'})});}catch(e){}}
+function b64ToU8SW(s){const pad='='.repeat((4-s.length%4)%4);const b=(s+pad).replace(/-/g,'+').replace(/_/g,'/');const raw=atob(b),out=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)out[i]=raw.charCodeAt(i);return out;}
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()).then(()=>registerExistingSubscription()))});
+self.addEventListener('pushsubscriptionchange',event=>{event.waitUntil((async()=>{try{const k=await fetch('/api/push/public-key',{cache:'no-store'}).then(r=>r.json());if(!k.enabled||!k.publicKey)return;const sub=await self.registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8SW(k.publicKey)});await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:'Galaxy Tablet PWA · renewed'})});}catch(e){}})())});
 self.addEventListener('message',e=>{if(e.data&&e.data.type==='SKIP_WAITING')self.skipWaiting()});
 self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
@@ -8635,7 +8706,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v8-pro"}
 
 
 @app.get("/manifest.webmanifest")
@@ -9509,7 +9580,7 @@ def _pwa_push_payload(item):
         return {
             "title": f"🐲 {name} {lead}분 전",
             "body": f"{when} 예정{late_note} · AION2 TOOL에서 확인하세요.",
-            "url": "/",
+            "url": "/?cmd=" + quote(({"agro":"아그로","kaira":"카이라","nahma":"나흐마","abyss":"어비스","sigong":"시공","gyunyeol":"균열","ati":"아티","fieldboss":"필보"}.get(_schedule_key(name)) or "필보"), safe=""),
             "tag": "schedule-" + key,
         }
     return {
@@ -9718,7 +9789,7 @@ def _pwa_maintenance_change_candidate(now=None):
         "payload": {
             "title": "⚠️ 아그로 시간 변경",
             "body": body,
-            "url": "/",
+            "url": "/?cmd=" + quote("아그로", safe=""),
             "tag": "agro-maintenance-" + re.sub(r"[^0-9A-Za-z_-]", "", source_id)[:80],
         },
     }
@@ -9870,7 +9941,7 @@ async def pwa_push_next():
         minutes=max(0, int(round((target-now).total_seconds()/60.0)))
         key=_schedule_key(name)
         out.append({
-            "type": typ, "name": name, "time": target.strftime("%m/%d %H:%M"),
+            "type": typ, "key": key, "name": name, "time": target.strftime("%m/%d %H:%M"),
             "minutes": minutes, "targetIso": target.astimezone(KST).isoformat(),
             "enabled": bool((settings.get("schedule") or {}).get(key, True)),
             "leads": settings.get("leads") or [30,10],
