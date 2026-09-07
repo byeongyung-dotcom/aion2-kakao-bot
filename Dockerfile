@@ -8,6 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY pwa_assets ./pwa_assets
 
 ENV PORT=10000
 
