@@ -8080,6 +8080,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 .primary{border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;border-radius:12px;padding:0 17px;font-weight:800;font-size:15px;cursor:pointer}.actions{display:flex;gap:9px;margin-top:10px}.ghost{flex:1;border:1px solid #3a4868;background:#111a2e;color:#eaf0ff;border-radius:11px;padding:11px;font-weight:700;cursor:pointer}
 .section{margin-top:16px}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.btn{border:1px solid #34415e;background:#121b2e;color:#eef3ff;border-radius:12px;padding:13px 8px;font-size:14px;font-weight:750;cursor:pointer;min-height:48px}.btn:active,.ghost:active,.primary:active{transform:scale(.985)}.btn.feature{border-color:#4d5b93;background:#182341}.btn.news{border-color:#405f64;background:#13282d}
 .result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
+.notifyrow{display:flex;align-items:center;justify-content:space-between;gap:12px}.notifystate{display:flex;align-items:center;gap:8px;font-size:13px;color:#c9d3e8}.notifydot{width:9px;height:9px;border-radius:50%;background:#6b7280;box-shadow:none}.notifydot.on{background:var(--good);box-shadow:0 0 12px var(--good)}.notifyactions{display:flex;gap:8px;flex-wrap:wrap}.notifybtn{border:1px solid #3d4b6c;background:#121b2f;color:#eef3ff;border-radius:11px;padding:10px 13px;font-weight:750;cursor:pointer}.notifybtn.on{border-color:#2f8f74;background:#123229}.notifybtn.test{border-color:#5365a0;background:#182342}.notifybtn.off{border-color:#70454d;background:#2b171b}.notifyhelp{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5}
 .footer{text-align:center;color:#6f7e99;font-size:11px;padding:18px 0 3px}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#202a44;border:1px solid #4a587c;border-radius:12px;padding:11px 15px;box-shadow:0 12px 40px #0008;display:none;z-index:50}
 @media(max-width:800px){.wrap{padding:15px}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
@@ -8105,6 +8106,21 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button class="ghost" id="rankingBtn">🏆 랭킹 조회</button>
           <button class="ghost" onclick="location.href='/compare'">⚖️ 캐릭터 비교</button>
         </div>
+      </div>
+
+      <div class="card section">
+        <div class="notifyrow">
+          <div>
+            <h2 style="margin-bottom:7px">🔔 앱 알림</h2>
+            <div class="notifystate"><span id="notifyDot" class="notifydot"></span><span id="notifyState">상태 확인 중…</span></div>
+          </div>
+          <div class="notifyactions">
+            <button id="notifyOnBtn" class="notifybtn on">알림 켜기</button>
+            <button id="notifyTestBtn" class="notifybtn test">테스트</button>
+            <button id="notifyOffBtn" class="notifybtn off">끄기</button>
+          </div>
+        </div>
+        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 시간과 새 공지/CM/업데이트를 갤럭시탭 알림으로 받습니다.</div>
       </div>
 
       <div class="card section">
@@ -8170,6 +8186,81 @@ document.querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',(
 $('detailBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n||!s)return toast('캐릭터명과 서버를 입력해 주세요.');location.href='/detail?name='+encodeURIComponent(n)+'&server='+encodeURIComponent(s)};
 $('rankingBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n)return toast('캐릭터명을 입력해 주세요.');run('랭킹 '+n+(s||''))};
 ['charName','serverName'].forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter')$('detailBtn').click()}));
+
+function b64ToU8(base64String){
+  const padding='='.repeat((4-base64String.length%4)%4);
+  const base64=(base64String+padding).replace(/-/g,'+').replace(/_/g,'/');
+  const raw=atob(base64), out=new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i]=raw.charCodeAt(i);
+  return out;
+}
+async function getPushSubscription(){
+  if(!('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+  const reg=await navigator.serviceWorker.ready;
+  return await reg.pushManager.getSubscription();
+}
+async function updateNotifyState(){
+  const state=$('notifyState'), dot=$('notifyDot');
+  if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){
+    state.textContent='이 기기에서 푸시 알림 미지원'; dot.classList.remove('on'); return;
+  }
+  const sub=await getPushSubscription().catch(()=>null);
+  if(Notification.permission==='granted' && sub){
+    fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:'Galaxy Tablet PWA'})}).catch(()=>{});
+    state.textContent='알림 ON · 이 태블릿 등록됨'; dot.classList.add('on');
+  }else if(Notification.permission==='denied'){
+    state.textContent='알림 차단됨 · Android 설정에서 허용 필요'; dot.classList.remove('on');
+  }else{
+    state.textContent='알림 OFF'; dot.classList.remove('on');
+  }
+}
+async function enablePush(){
+  try{
+    if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){
+      return toast('이 기기에서는 웹 푸시를 지원하지 않습니다.');
+    }
+    const perm=await Notification.requestPermission();
+    if(perm!=='granted'){await updateNotifyState();return toast('알림 권한이 허용되지 않았습니다.');}
+    const reg=await navigator.serviceWorker.ready;
+    let sub=await reg.pushManager.getSubscription();
+    if(!sub){
+      const k=await fetch('/api/push/public-key',{cache:'no-store'}).then(r=>r.json());
+      if(!k.enabled || !k.publicKey) return toast('서버 푸시 키 설정이 아직 안 됐습니다.');
+      sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToU8(k.publicKey)});
+    }
+    const r=await fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:'Galaxy Tablet PWA'})});
+    const d=await r.json();
+    if(!d.ok) throw new Error(d.error||'등록 실패');
+    await updateNotifyState();
+    toast('앱 알림이 켜졌습니다.');
+  }catch(e){toast('알림 설정 실패: '+(e?.message||e));}
+}
+async function testPush(){
+  try{
+    const sub=await getPushSubscription();
+    if(!sub) return toast('먼저 알림 켜기를 눌러주세요.');
+    const r=await fetch('/api/push/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint})});
+    const d=await r.json();
+    if(!d.ok) throw new Error(d.error||'테스트 실패');
+    toast('테스트 알림을 보냈습니다.');
+  }catch(e){toast('테스트 실패: '+(e?.message||e));}
+}
+async function disablePush(){
+  try{
+    const sub=await getPushSubscription();
+    if(sub){
+      await fetch('/api/push/unsubscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint:sub.endpoint})}).catch(()=>{});
+      await sub.unsubscribe().catch(()=>{});
+    }
+    await updateNotifyState();
+    toast('앱 알림을 껐습니다.');
+  }catch(e){toast('알림 해제 실패: '+(e?.message||e));}
+}
+$('notifyOnBtn').onclick=enablePush;
+$('notifyTestBtn').onclick=testPush;
+$('notifyOffBtn').onclick=disablePush;
+window.addEventListener('load',()=>setTimeout(updateNotifyState,700));
+
 let deferredPrompt=null;const installBtn=$('installBtn');
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
 installBtn.onclick=async()=>{if(deferredPrompt){deferredPrompt.prompt();await deferredPrompt.userChoice;deferredPrompt=null}else{toast('Chrome 메뉴(⋮) → 앱 설치 또는 홈 화면에 추가')}};
@@ -8195,7 +8286,7 @@ PWA_MANIFEST = {
     ]
 }
 
-PWA_SW = r"""const CACHE='aion2-tool-shell-v1';
+PWA_SW = r"""const CACHE='aion2-tool-shell-v2';
 const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});
@@ -8203,11 +8294,33 @@ self.addEventListener('fetch',e=>{
   if(e.request.method!=='GET')return;
   const u=new URL(e.request.url);
   if(u.origin!==location.origin)return;
-  if(u.pathname.startsWith('/api/')||u.pathname.startsWith('/openchat')||u.pathname.startsWith('/c/')||u.pathname.startsWith('/detail'))return;
+  if(u.pathname.startsWith('/api/')||u.pathname.startsWith('/openchat')||u.pathname.startsWith('/alerts/')||u.pathname.startsWith('/c/')||u.pathname.startsWith('/detail'))return;
   if(e.request.mode==='navigate'){
     e.respondWith(fetch(e.request).catch(()=>caches.match('/')));return;
   }
   e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
+});
+self.addEventListener('push',event=>{
+  let d={title:'AION2 TOOL',body:'새 알림이 있습니다.',url:'/'};
+  try{if(event.data)d=Object.assign(d,event.data.json())}catch(e){try{d.body=event.data.text()}catch(_){}}
+  const options={
+    body:d.body||'',
+    icon:'/pwa/icon-192.png',
+    badge:'/pwa/icon-192.png',
+    tag:d.tag||('aion2-'+Date.now()),
+    renotify:true,
+    data:{url:d.url||'/'},
+    vibrate:[180,80,180]
+  };
+  event.waitUntil(self.registration.showNotification(d.title||'AION2 TOOL',options));
+});
+self.addEventListener('notificationclick',event=>{
+  event.notification.close();
+  const target=(event.notification.data&&event.notification.data.url)||'/';
+  event.waitUntil(clients.matchAll({type:'window',includeUncontrolled:true}).then(list=>{
+    for(const c of list){if('focus' in c){c.navigate(target);return c.focus()}}
+    if(clients.openWindow)return clients.openWindow(target);
+  }));
 });"""
 
 @app.get("/manifest.webmanifest")
@@ -8855,6 +8968,365 @@ async def openchat_alert_ack(room: str = "", key: str = "", room_alias: str = ""
         state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
         _save_openchat_alert_state(state)
     return {"ok": True, "room": room_key, "key": alert_key, "acked": True}
+
+
+# =========================================================
+# PWA Web Push notifications
+# =========================================================
+
+PWA_PUSH_ROOM = "PWA:AION2 TOOL"
+PWA_PUSH_SUBSCRIPTIONS_FILE = _state_path(
+    "PWA_PUSH_SUBSCRIPTIONS_FILE",
+    "pwa_push_subscriptions.json",
+    legacy_paths=("/tmp/aion2_pwa_push_subscriptions.json",),
+)
+PWA_VAPID_PUBLIC_KEY = str(os.getenv("VAPID_PUBLIC_KEY") or "").strip()
+PWA_VAPID_PRIVATE_KEY = str(os.getenv("VAPID_PRIVATE_KEY") or "").strip()
+PWA_VAPID_SUBJECT = str(os.getenv("VAPID_SUBJECT") or "https://aion2-kakao-bot.onrender.com").strip()
+PWA_PUSH_CHECK_LOCK = asyncio.Lock()
+PWA_PUSH_BACKGROUND_TASK = None
+
+
+def _load_pwa_push_subscriptions():
+    raw = _safe_json_load(PWA_PUSH_SUBSCRIPTIONS_FILE, {"subscriptions": []})
+    rows = raw.get("subscriptions") if isinstance(raw, dict) else []
+    clean = []
+    seen = set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        sub = row.get("subscription") if isinstance(row.get("subscription"), dict) else {}
+        endpoint = str(sub.get("endpoint") or "").strip()
+        keys = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
+        if not endpoint or not keys.get("p256dh") or not keys.get("auth") or endpoint in seen:
+            continue
+        seen.add(endpoint)
+        clean.append({
+            "subscription": {
+                "endpoint": endpoint,
+                "expirationTime": sub.get("expirationTime"),
+                "keys": {
+                    "p256dh": str(keys.get("p256dh") or ""),
+                    "auth": str(keys.get("auth") or ""),
+                },
+            },
+            "label": str(row.get("label") or "AION2 TOOL")[:80],
+            "created": float(row.get("created") or time.time()),
+            "updated": float(row.get("updated") or time.time()),
+        })
+    return clean
+
+
+def _save_pwa_push_subscriptions(rows):
+    return _atomic_json_write(PWA_PUSH_SUBSCRIPTIONS_FILE, {"subscriptions": rows})
+
+
+def _pwa_push_configured():
+    return bool(PWA_VAPID_PUBLIC_KEY and PWA_VAPID_PRIVATE_KEY)
+
+
+def _pwa_push_payload(item):
+    item = item or {}
+    typ = str(item.get("type") or "")
+    key = str(item.get("key") or "")
+    if typ == "board":
+        board = str(item.get("board") or "공지")
+        icon = "📢" if board in ("공지", "CM") else "🆕"
+        return {
+            "title": f"{icon} AION2 {board}",
+            "body": str(item.get("title") or "새 글이 등록되었습니다."),
+            "url": f"/p/{quote(board, safe='')}/{quote(str(item.get('id') or ''), safe='')}",
+            "tag": "board-" + key,
+        }
+    if typ in ("boss", "content"):
+        name = str(item.get("boss") or item.get("content") or "AION2 콘텐츠")
+        lead = int(item.get("alertMinutes") or 0)
+        when = str(item.get("time") or "")
+        return {
+            "title": f"🐲 {name} {lead}분 전",
+            "body": f"{when} 예정 · AION2 TOOL에서 확인하세요.",
+            "url": "/",
+            "tag": "schedule-" + key,
+        }
+    return {
+        "title": "🔔 AION2 TOOL",
+        "body": str(item.get("title") or "알림 시스템 테스트"),
+        "url": "/",
+        "tag": "test-" + key,
+    }
+
+
+async def _pwa_send_one(subscription, payload):
+    if not _pwa_push_configured():
+        return {"ok": False, "status": 0, "error": "VAPID_NOT_CONFIGURED"}
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception as e:
+        return {"ok": False, "status": 0, "error": f"PYWEBPUSH_MISSING:{type(e).__name__}"}
+
+    def _send():
+        try:
+            response = webpush(
+                subscription_info=subscription,
+                data=json.dumps(payload, ensure_ascii=False),
+                vapid_private_key=PWA_VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": PWA_VAPID_SUBJECT},
+                headers={"TTL": "600"},
+                timeout=12,
+            )
+            status = int(getattr(response, "status_code", 201) or 201)
+            return {"ok": 200 <= status < 300, "status": status}
+        except WebPushException as e:
+            status = int(getattr(e, "status_code", 0) or 0)
+            return {"ok": False, "status": status, "error": str(e)[:240]}
+        except Exception as e:
+            return {"ok": False, "status": 0, "error": f"{type(e).__name__}:{str(e)[:220]}"}
+
+    return await asyncio.to_thread(_send)
+
+
+async def _pwa_send_payload_to_all(payload, only_endpoint=""):
+    rows = _load_pwa_push_subscriptions()
+    if only_endpoint:
+        rows = [
+            row for row in rows
+            if str((row.get("subscription") or {}).get("endpoint") or "") == only_endpoint
+        ]
+    if not rows:
+        return {"ok": False, "sent": 0, "failed": 0, "removed": 0, "error": "NO_SUBSCRIPTIONS"}
+
+    sent = 0
+    failed = 0
+    removed = 0
+    dead = set()
+    errors = []
+    for row in rows:
+        sub = row.get("subscription") or {}
+        endpoint = str(sub.get("endpoint") or "")
+        result = await _pwa_send_one(sub, payload)
+        if result.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+            status = int(result.get("status") or 0)
+            if status in (404, 410):
+                dead.add(endpoint)
+                removed += 1
+            if result.get("error"):
+                errors.append(str(result.get("error"))[:160])
+
+    if dead:
+        all_rows = _load_pwa_push_subscriptions()
+        _save_pwa_push_subscriptions([
+            row for row in all_rows
+            if str((row.get("subscription") or {}).get("endpoint") or "") not in dead
+        ])
+
+    return {
+        "ok": sent > 0,
+        "sent": sent,
+        "failed": failed,
+        "removed": removed,
+        "errors": errors[:3],
+    }
+
+
+def _pwa_alert_ack_key(room, alert_key):
+    state = _load_openchat_alert_state()
+    _, delivery = _openchat_get_delivery(state, room)
+    sent_keys = list(dict.fromkeys(
+        [str(x) for x in (delivery.get("sentKeys") or []) if str(x)] + [alert_key]
+    ))[-1000:]
+    delivery["sentKeys"] = sent_keys
+    leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
+    leases.pop(alert_key, None)
+    delivery["leases"] = leases
+    delivery["testQueue"] = [
+        x for x in (delivery.get("testQueue") or [])
+        if str((x or {}).get("key") or "") != alert_key
+    ]
+    delivery["boardPending"] = [
+        x for x in (delivery.get("boardPending") or [])
+        if str(((x or {}).get("item") or {}).get("key") or "") != alert_key
+    ]
+    state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
+    _save_openchat_alert_state(state)
+
+
+def _pwa_alert_release_lease(room, alert_key):
+    state = _load_openchat_alert_state()
+    _, delivery = _openchat_get_delivery(state, room)
+    leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
+    leases.pop(alert_key, None)
+    delivery["leases"] = leases
+    state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
+    _save_openchat_alert_state(state)
+
+
+async def _run_pwa_push_alert_check():
+    if not _pwa_push_configured():
+        return {"ok": False, "configured": False, "error": "VAPID_NOT_CONFIGURED"}
+    if not _load_pwa_push_subscriptions():
+        return {"ok": True, "configured": True, "subscriptions": 0, "items": 0, "sent": 0}
+
+    async with PWA_PUSH_CHECK_LOCK:
+        body = await openchat_alerts(room=PWA_PUSH_ROOM)
+        items = body.get("items") if isinstance(body, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        sent_total = 0
+        failed_total = 0
+        results = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            payload = _pwa_push_payload(item)
+            delivery = await _pwa_send_payload_to_all(payload)
+            sent_total += int(delivery.get("sent") or 0)
+            failed_total += int(delivery.get("failed") or 0)
+            results.append({"key": key, **delivery})
+            if key:
+                if delivery.get("ok"):
+                    _pwa_alert_ack_key(PWA_PUSH_ROOM, key)
+                else:
+                    _pwa_alert_release_lease(PWA_PUSH_ROOM, key)
+
+        return {
+            "ok": True,
+            "configured": True,
+            "subscriptions": len(_load_pwa_push_subscriptions()),
+            "items": len(items),
+            "sent": sent_total,
+            "failed": failed_total,
+            "results": results,
+        }
+
+
+@app.get("/api/push/public-key")
+async def pwa_push_public_key():
+    return {
+        "ok": True,
+        "enabled": _pwa_push_configured(),
+        "publicKey": PWA_VAPID_PUBLIC_KEY if _pwa_push_configured() else "",
+    }
+
+
+@app.get("/api/push/status")
+async def pwa_push_status():
+    return {
+        "ok": True,
+        "configured": _pwa_push_configured(),
+        "subscriptions": len(_load_pwa_push_subscriptions()),
+        "persistentStorage": AION2_STORAGE_PERSISTENT,
+    }
+
+
+@app.post("/api/push/subscribe")
+async def pwa_push_subscribe(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    sub = data.get("subscription") if isinstance(data, dict) else None
+    if not isinstance(sub, dict):
+        return JSONResponse({"ok": False, "error": "BAD_SUBSCRIPTION"}, status_code=400)
+
+    endpoint = str(sub.get("endpoint") or "").strip()
+    keys = sub.get("keys") if isinstance(sub.get("keys"), dict) else {}
+    if not endpoint.startswith("https://") or not keys.get("p256dh") or not keys.get("auth"):
+        return JSONResponse({"ok": False, "error": "BAD_SUBSCRIPTION"}, status_code=400)
+
+    normalized = {
+        "endpoint": endpoint,
+        "expirationTime": sub.get("expirationTime"),
+        "keys": {
+            "p256dh": str(keys.get("p256dh") or ""),
+            "auth": str(keys.get("auth") or ""),
+        },
+    }
+    now_epoch = time.time()
+    rows = _load_pwa_push_subscriptions()
+    found = False
+    for row in rows:
+        if str((row.get("subscription") or {}).get("endpoint") or "") == endpoint:
+            row["subscription"] = normalized
+            row["label"] = str(data.get("label") or row.get("label") or "AION2 TOOL")[:80]
+            row["updated"] = now_epoch
+            found = True
+            break
+    if not found:
+        rows.append({
+            "subscription": normalized,
+            "label": str(data.get("label") or "AION2 TOOL")[:80],
+            "created": now_epoch,
+            "updated": now_epoch,
+        })
+    ok = _save_pwa_push_subscriptions(rows[-20:])
+    return {"ok": bool(ok), "subscriptions": len(rows[-20:]), "configured": _pwa_push_configured()}
+
+
+@app.post("/api/push/unsubscribe")
+async def pwa_push_unsubscribe(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    endpoint = str((data or {}).get("endpoint") or "").strip()
+    rows = _load_pwa_push_subscriptions()
+    kept = [
+        row for row in rows
+        if str((row.get("subscription") or {}).get("endpoint") or "") != endpoint
+    ]
+    _save_pwa_push_subscriptions(kept)
+    return {"ok": True, "subscriptions": len(kept)}
+
+
+@app.post("/api/push/test")
+async def pwa_push_test(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    endpoint = str((data or {}).get("endpoint") or "").strip()
+    if not endpoint:
+        return JSONResponse({"ok": False, "error": "NO_ENDPOINT"}, status_code=400)
+    payload = {
+        "title": "🔔 AION2 TOOL",
+        "body": "앱 푸시 알림 연결 완료 · 앱을 닫아도 알림을 받을 수 있습니다.",
+        "url": "/",
+        "tag": "aion2-push-test-" + str(int(time.time())),
+    }
+    result = await _pwa_send_payload_to_all(payload, only_endpoint=endpoint)
+    status = 200 if result.get("ok") else 500
+    return JSONResponse(result, status_code=status)
+
+
+@app.get("/alerts/check")
+async def alerts_check(secret: str = ""):
+    expected = str(os.getenv("ALERT_CRON_SECRET") or "").strip()
+    if expected and str(secret or "") != expected:
+        return JSONResponse({"ok": False, "error": "UNAUTHORIZED"}, status_code=403)
+    return await _run_pwa_push_alert_check()
+
+
+async def _pwa_push_background_loop():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            if _pwa_push_configured() and _load_pwa_push_subscriptions():
+                await _run_pwa_push_alert_check()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _start_pwa_push_background():
+    global PWA_PUSH_BACKGROUND_TASK
+    if PWA_PUSH_BACKGROUND_TASK is None or PWA_PUSH_BACKGROUND_TASK.done():
+        PWA_PUSH_BACKGROUND_TASK = asyncio.create_task(_pwa_push_background_loop())
 
 
 async def character_card_data_fast(nickname: str, server_name: str):
