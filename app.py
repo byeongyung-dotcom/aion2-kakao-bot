@@ -8081,6 +8081,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 .section{margin-top:16px}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.btn{border:1px solid #34415e;background:#121b2e;color:#eef3ff;border-radius:12px;padding:13px 8px;font-size:14px;font-weight:750;cursor:pointer;min-height:48px}.btn:active,.ghost:active,.primary:active{transform:scale(.985)}.btn.feature{border-color:#4d5b93;background:#182341}.btn.news{border-color:#405f64;background:#13282d}
 .result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
 .notifyrow{display:flex;align-items:center;justify-content:space-between;gap:12px}.notifystate{display:flex;align-items:center;gap:8px;font-size:13px;color:#c9d3e8}.notifydot{width:9px;height:9px;border-radius:50%;background:#6b7280;box-shadow:none}.notifydot.on{background:var(--good);box-shadow:0 0 12px var(--good)}.notifyactions{display:flex;gap:8px;flex-wrap:wrap}.notifybtn{border:1px solid #3d4b6c;background:#121b2f;color:#eef3ff;border-radius:11px;padding:10px 13px;font-weight:750;cursor:pointer}.notifybtn.on{border-color:#2f8f74;background:#123229}.notifybtn.test{border-color:#5365a0;background:#182342}.notifybtn.off{border-color:#70454d;background:#2b171b}.notifyhelp{font-size:12px;color:var(--muted);margin-top:10px;line-height:1.5}
+.notifytools{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.notifytools .notifybtn{padding:8px 11px;font-size:12px}.settingsbox{display:none;margin-top:12px;padding:13px;border:1px solid #2d3a58;border-radius:13px;background:#0d1525}.settingsbox.open{display:block}.settingshead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.settingshead b{font-size:13px}.settinglabel{font-size:12px;color:#aebbd1;margin:11px 0 7px}.checkgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.checkchip{display:flex;align-items:center;gap:7px;border:1px solid #34415e;background:#121b2e;border-radius:10px;padding:9px 10px;font-size:12px;color:#eef3ff}.checkchip input{width:auto;margin:0;accent-color:#5a8cff}.saveprefs{width:100%;margin-top:12px;border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:#fff;border-radius:11px;padding:11px;font-weight:800}.nextline{font-size:11px;color:#8090aa;margin-top:8px}@media(max-width:600px){.checkgrid{grid-template-columns:repeat(2,1fr)}}
 .footer{text-align:center;color:#6f7e99;font-size:11px;padding:18px 0 3px}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#202a44;border:1px solid #4a587c;border-radius:12px;padding:11px 15px;box-shadow:0 12px 40px #0008;display:none;z-index:50}
 @media(max-width:800px){.wrap{padding:15px}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
@@ -8120,7 +8121,40 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <button id="notifyOffBtn" class="notifybtn off">끄기</button>
           </div>
         </div>
-        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 30분 전·10분 전, 새 공지/CM/업데이트, 점검으로 인한 아그로 시간 변경을 갤럭시탭 알림으로 받습니다.</div>
+        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 30분 전·10분 전, 공지/CM/업데이트, 점검으로 인한 아그로 시간 변경을 갤럭시탭 알림으로 받습니다.</div>
+        <div class="notifytools">
+          <button id="notifySettingsBtn" class="notifybtn">⚙️ 알림 설정</button>
+          <button id="notifyNextBtn" class="notifybtn">⏱️ 다음 알림</button>
+          <button id="notifyHistoryBtn" class="notifybtn">🧾 알림 기록</button>
+        </div>
+        <div id="notifySettingsBox" class="settingsbox">
+          <div class="settingshead"><b>알림 세부 설정</b><span style="font-size:11px;color:#7f8da8">이 태블릿용 PWA 설정</span></div>
+          <div class="settinglabel">알림 시점</div>
+          <div class="checkgrid">
+            <label class="checkchip"><input id="lead30" type="checkbox" checked>30분 전</label>
+            <label class="checkchip"><input id="lead10" type="checkbox" checked>10분 전</label>
+          </div>
+          <div class="settinglabel">필보 / 콘텐츠</div>
+          <div class="checkgrid">
+            <label class="checkchip"><input data-schedule="agro" type="checkbox" checked>아그로</label>
+            <label class="checkchip"><input data-schedule="kaira" type="checkbox" checked>카이라</label>
+            <label class="checkchip"><input data-schedule="nahma" type="checkbox" checked>나흐마</label>
+            <label class="checkchip"><input data-schedule="abyss" type="checkbox" checked>어비스</label>
+            <label class="checkchip"><input data-schedule="sigong" type="checkbox" checked>시공</label>
+            <label class="checkchip"><input data-schedule="gyunyeol" type="checkbox" checked>균열</label>
+            <label class="checkchip"><input data-schedule="ati" type="checkbox" checked>아티</label>
+            <label class="checkchip"><input data-schedule="fieldboss" type="checkbox" checked>필드보스</label>
+          </div>
+          <div class="settinglabel">소식 / 변경</div>
+          <div class="checkgrid">
+            <label class="checkchip"><input data-board="공지" type="checkbox" checked>공지</label>
+            <label class="checkchip"><input data-board="CM" type="checkbox" checked>CM</label>
+            <label class="checkchip"><input data-board="업데이트" type="checkbox" checked>업데이트</label>
+            <label class="checkchip"><input id="maintenanceAgro" type="checkbox" checked>아그로 변경</label>
+          </div>
+          <button id="saveNotifyPrefs" class="saveprefs">설정 저장</button>
+          <div class="nextline">설정 저장 후부터 새 알림에 적용됩니다.</div>
+        </div>
       </div>
 
       <div class="card section">
@@ -8214,6 +8248,54 @@ async function updateNotifyState(){
     state.textContent='알림 OFF'; dot.classList.remove('on');
   }
 }
+async function loadNotifyPrefs(){
+  try{
+    const d=await fetch('/api/push/settings',{cache:'no-store'}).then(r=>r.json());
+    if(!d.ok)return;
+    const p=d.settings||{};
+    const leads=p.leads||[30,10];
+    $('lead30').checked=leads.includes(30); $('lead10').checked=leads.includes(10);
+    document.querySelectorAll('[data-schedule]').forEach(el=>{el.checked=(p.schedule||{})[el.dataset.schedule]!==false});
+    document.querySelectorAll('[data-board]').forEach(el=>{el.checked=(p.boards||{})[el.dataset.board]!==false});
+    $('maintenanceAgro').checked=p.maintenanceAgro!==false;
+  }catch(e){}
+}
+async function saveNotifyPrefs(){
+  try{
+    const leads=[]; if($('lead30').checked)leads.push(30); if($('lead10').checked)leads.push(10);
+    if(!leads.length)return toast('30분 전 또는 10분 전 중 하나는 선택해 주세요.');
+    const schedule={}; document.querySelectorAll('[data-schedule]').forEach(el=>schedule[el.dataset.schedule]=el.checked);
+    const boards={}; document.querySelectorAll('[data-board]').forEach(el=>boards[el.dataset.board]=el.checked);
+    const body={leads,schedule,boards,maintenanceAgro:$('maintenanceAgro').checked};
+    const r=await fetch('/api/push/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json(); if(!d.ok)throw new Error(d.error||'저장 실패');
+    toast('알림 설정을 저장했습니다.');
+  }catch(e){toast('설정 저장 실패: '+(e?.message||e));}
+}
+async function showNextAlerts(){
+  statusEl.textContent='다음 알림 계산 중…';
+  try{
+    const d=await fetch('/api/push/next',{cache:'no-store'}).then(r=>r.json());
+    const rows=d.items||[];
+    let t='⏱️ 다음 알림 예정\n\n';
+    for(const x of rows){t+=(x.enabled?'🔔 ':'🔕 ')+x.name+'\n   '+x.time+' · '+x.minutes+'분 후 · '+(x.leads||[]).map(v=>v+'분 전').join(' / ')+'\n\n';}
+    renderText(t.trim()||'예정된 일정이 없습니다.'); statusEl.textContent='알림 일정 · '+new Date().toLocaleTimeString('ko-KR');
+  }catch(e){renderText('다음 알림 조회 실패\n'+(e?.message||e));}
+}
+async function showPushHistory(){
+  statusEl.textContent='알림 기록 조회 중…';
+  try{
+    const d=await fetch('/api/push/history',{cache:'no-store'}).then(r=>r.json());
+    const rows=d.items||[];
+    let t='🧾 최근 앱 알림 기록\n\n';
+    for(const x of rows){t+=(x.time||'')+'  '+(x.title||'')+'\n'+(x.body||'')+'\n\n';}
+    renderText(t.trim()||'아직 전송된 알림 기록이 없습니다.'); statusEl.textContent='최근 '+rows.length+'건';
+  }catch(e){renderText('알림 기록 조회 실패\n'+(e?.message||e));}
+}
+$('notifySettingsBtn').onclick=()=>{$('notifySettingsBox').classList.toggle('open');loadNotifyPrefs();};
+$('saveNotifyPrefs').onclick=saveNotifyPrefs;
+$('notifyNextBtn').onclick=showNextAlerts;
+$('notifyHistoryBtn').onclick=showPushHistory;
 async function enablePush(){
   try{
     if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){
@@ -8259,7 +8341,7 @@ async function disablePush(){
 $('notifyOnBtn').onclick=enablePush;
 $('notifyTestBtn').onclick=testPush;
 $('notifyOffBtn').onclick=disablePush;
-window.addEventListener('load',()=>setTimeout(updateNotifyState,700));
+window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900)});
 
 let deferredPrompt=null;const installBtn=$('installBtn');
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
@@ -8985,6 +9067,85 @@ PWA_VAPID_PRIVATE_KEY = str(os.getenv("VAPID_PRIVATE_KEY") or "").strip()
 PWA_VAPID_SUBJECT = str(os.getenv("VAPID_SUBJECT") or "https://aion2-kakao-bot.onrender.com").strip()
 PWA_PUSH_CHECK_LOCK = asyncio.Lock()
 PWA_PUSH_BACKGROUND_TASK = None
+PWA_PUSH_HISTORY_FILE = _state_path(
+    "PWA_PUSH_HISTORY_FILE",
+    "pwa_push_history.json",
+    legacy_paths=("/tmp/aion2_pwa_push_history.json",),
+)
+
+PWA_SCHEDULE_NAMES = {
+    "agro": "정령왕 아그로",
+    "kaira": "감시자 카이라",
+    "nahma": "수호신장 나흐마",
+    "abyss": "어비스 보스",
+    "sigong": "시공쟁탈전",
+    "gyunyeol": "균열지대",
+    "ati": "아티쟁",
+    "fieldboss": "필드보스",
+}
+
+def _default_pwa_alert_settings():
+    return {
+        "leads": [30, 10],
+        "schedule": {key: True for key in PWA_SCHEDULE_NAMES},
+        "boards": {"공지": True, "CM": True, "업데이트": True},
+        "maintenanceAgro": True,
+    }
+
+def _get_pwa_alert_settings():
+    data = _load_boss_schedule_overrides()
+    raw = data.get("pwaAlertSettings") if isinstance(data.get("pwaAlertSettings"), dict) else {}
+    out = _default_pwa_alert_settings()
+    leads = raw.get("leads") if isinstance(raw, dict) else None
+    if isinstance(leads, list):
+        clean=[]
+        for value in leads:
+            try: n=int(value)
+            except Exception: continue
+            if 1 <= n <= 180 and n not in clean: clean.append(n)
+        if clean: out["leads"] = sorted(clean, reverse=True)
+    for group in ("schedule", "boards"):
+        rows = raw.get(group) if isinstance(raw, dict) and isinstance(raw.get(group), dict) else {}
+        for key in out[group]:
+            if key in rows: out[group][key] = bool(rows.get(key))
+    if isinstance(raw, dict) and "maintenanceAgro" in raw:
+        out["maintenanceAgro"] = bool(raw.get("maintenanceAgro"))
+    return out
+
+def _save_pwa_alert_settings(settings):
+    data = _load_boss_schedule_overrides()
+    data["pwaAlertSettings"] = settings
+    ok = _save_boss_schedule_overrides(data)
+    if ok:
+        for name in PWA_SCHEDULE_NAMES.values():
+            _set_schedule_alert_leads(name, settings.get("leads") or [30, 10], PWA_PUSH_ROOM)
+    return ok
+
+def _pwa_item_enabled(item, settings=None):
+    settings = settings or _get_pwa_alert_settings()
+    typ = str((item or {}).get("type") or "")
+    if typ == "board":
+        return bool((settings.get("boards") or {}).get(str(item.get("board") or ""), True))
+    if typ in ("boss", "content"):
+        name = str(item.get("boss") or item.get("content") or "")
+        key = _schedule_key(name)
+        return bool((settings.get("schedule") or {}).get(key, True)) if key else True
+    return True
+
+def _load_pwa_push_history():
+    raw = _safe_json_load(PWA_PUSH_HISTORY_FILE, {"items": []})
+    rows = raw.get("items") if isinstance(raw, dict) else []
+    return [x for x in rows if isinstance(x, dict)][-100:]
+
+def _record_pwa_push_history(payload):
+    rows = _load_pwa_push_history()
+    rows.append({
+        "time": datetime.now(KST).strftime("%m/%d %H:%M"),
+        "title": str((payload or {}).get("title") or ""),
+        "body": str((payload or {}).get("body") or ""),
+        "tag": str((payload or {}).get("tag") or ""),
+    })
+    return _atomic_json_write(PWA_PUSH_HISTORY_FILE, {"items": rows[-100:]})
 
 
 def _load_pwa_push_subscriptions():
@@ -9285,6 +9446,7 @@ async def _run_pwa_push_alert_check():
         return {"ok": True, "configured": True, "subscriptions": 0, "items": 0, "sent": 0}
 
     async with PWA_PUSH_CHECK_LOCK:
+        settings = _get_pwa_alert_settings()
         # Refresh the official maintenance anchor first. The normal source layer
         # caches this for five minutes, so this does not hammer the official site.
         try:
@@ -9295,8 +9457,14 @@ async def _run_pwa_push_alert_check():
         maintenance_result = None
         maintenance_candidate = _pwa_maintenance_change_candidate(datetime.now(KST))
         if maintenance_candidate:
-            maintenance_result = await _pwa_send_payload_to_all(maintenance_candidate["payload"])
-            if maintenance_result.get("ok"):
+            if settings.get("maintenanceAgro", True):
+                maintenance_result = await _pwa_send_payload_to_all(maintenance_candidate["payload"])
+                if maintenance_result.get("ok"):
+                    _record_pwa_push_history(maintenance_candidate["payload"])
+                    _pwa_mark_maintenance_change_sent(maintenance_candidate)
+            else:
+                # Silenced changes are still consumed so an old maintenance shift
+                # does not fire later merely because the toggle was re-enabled.
                 _pwa_mark_maintenance_change_sent(maintenance_candidate)
 
         body = await openchat_alerts(room=PWA_PUSH_ROOM)
@@ -9313,6 +9481,10 @@ async def _run_pwa_push_alert_check():
             if not isinstance(item, dict):
                 continue
             key = str(item.get("key") or "").strip()
+            if not _pwa_item_enabled(item, settings):
+                if key:
+                    _pwa_alert_ack_key(PWA_PUSH_ROOM, key)
+                continue
             payload = _pwa_push_payload(item)
             delivery = await _pwa_send_payload_to_all(payload)
             sent_total += int(delivery.get("sent") or 0)
@@ -9320,6 +9492,7 @@ async def _run_pwa_push_alert_check():
             results.append({"key": key, **delivery})
             if key:
                 if delivery.get("ok"):
+                    _record_pwa_push_history(payload)
                     _pwa_alert_ack_key(PWA_PUSH_ROOM, key)
                 else:
                     _pwa_alert_release_lease(PWA_PUSH_ROOM, key)
@@ -9333,6 +9506,68 @@ async def _run_pwa_push_alert_check():
             "failed": failed_total,
             "results": results,
         }
+
+
+@app.get("/api/push/settings")
+async def pwa_push_settings_get():
+    return {"ok": True, "settings": _get_pwa_alert_settings()}
+
+
+@app.post("/api/push/settings")
+async def pwa_push_settings_set(request: Request):
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    current = _get_pwa_alert_settings()
+    leads = raw.get("leads") if isinstance(raw, dict) else None
+    if isinstance(leads, list):
+        clean=[]
+        for value in leads:
+            try: n=int(value)
+            except Exception: continue
+            if n in (10, 30) and n not in clean: clean.append(n)
+        if clean: current["leads"] = sorted(clean, reverse=True)
+    for group in ("schedule", "boards"):
+        rows = raw.get(group) if isinstance(raw, dict) and isinstance(raw.get(group), dict) else None
+        if rows is not None:
+            for key in current[group]:
+                if key in rows: current[group][key] = bool(rows.get(key))
+    if isinstance(raw, dict) and "maintenanceAgro" in raw:
+        current["maintenanceAgro"] = bool(raw.get("maintenanceAgro"))
+    ok = _save_pwa_alert_settings(current)
+    return {"ok": bool(ok), "settings": current}
+
+
+@app.get("/api/push/next")
+async def pwa_push_next():
+    now = datetime.now(KST)
+    try:
+        await latest_maintenance_anchor()
+    except Exception:
+        pass
+    targets = _schedule_alert_targets(now)
+    if targets:
+        targets[0] = ("boss", "정령왕 아그로", next_agro_from_anchor(_cached_alert_agro_anchor(), now))
+    settings = _get_pwa_alert_settings()
+    out=[]
+    for typ, name, target in targets:
+        if target is None: continue
+        minutes=max(0, int(round((target-now).total_seconds()/60.0)))
+        key=_schedule_key(name)
+        out.append({
+            "type": typ, "name": name, "time": target.strftime("%m/%d %H:%M"),
+            "minutes": minutes, "enabled": bool((settings.get("schedule") or {}).get(key, True)),
+            "leads": settings.get("leads") or [30,10],
+        })
+    out.sort(key=lambda x: x["minutes"])
+    return {"ok": True, "items": out}
+
+
+@app.get("/api/push/history")
+async def pwa_push_history():
+    rows = list(reversed(_load_pwa_push_history()[-30:]))
+    return {"ok": True, "items": rows}
 
 
 @app.get("/api/push/public-key")
@@ -9430,6 +9665,8 @@ async def pwa_push_test(request: Request):
         "tag": "aion2-push-test-" + str(int(time.time())),
     }
     result = await _pwa_send_payload_to_all(payload, only_endpoint=endpoint)
+    if result.get("ok"):
+        _record_pwa_push_history(payload)
     status = 200 if result.get("ok") else 500
     return JSONResponse(result, status_code=status)
 
