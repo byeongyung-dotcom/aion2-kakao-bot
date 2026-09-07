@@ -8053,7 +8053,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V10 MESSENGER FINAL"
+PWA_APP_VERSION = "V11 ALERT RETRY FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -8727,7 +8727,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v10-messenger-final"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v11-alert-retry-fix"}
 
 
 @app.get("/manifest.webmanifest")
@@ -9346,10 +9346,10 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                         "_legacyKey": _legacy_scheduled_alert_key(name, target, lead),
                     })
 
-        # Strong server lease: one poller may claim a scheduled/test alert for
-        # the whole useful delivery window. This prevents duplicate Kakao sends
-        # even if an old phone timer is still alive or ACK is delayed/missed.
-        # ACK still permanently confirms successful delivery.
+        # Short delivery lease: prevent simultaneous duplicate pollers, but retry
+        # quickly when the phone fetched an item and failed to send/ACK it.
+        # MessengerBotR polls every 15 seconds, so an 8-second lease guarantees
+        # the next poll can retry. ACK is the only permanent delivery confirmation.
         sent_keys = set(str(x) for x in (delivery.get("sentKeys") or []) if str(x))
         leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
         leases = {
@@ -9367,7 +9367,7 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 continue
             if legacy_key and float(leases.get(legacy_key) or 0) > now_epoch:
                 continue
-            lease_seconds = 300.0
+            lease_seconds = 8.0
             leases[key] = now_epoch + lease_seconds
             item.pop("_legacyKey", None)
             fresh_items.append(item)
@@ -9468,10 +9468,10 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 continue
             if float(leases.get(key) or 0) > now_epoch:
                 continue
-            # Board alerts remain pending for up to 30 minutes; lease them for
-            # that whole validity window so stale/duplicate phone timers cannot
-            # resend the same post.
-            leases[key] = now_epoch + 1800.0
+            # Board alerts remain pending for up to 30 minutes, but the lease is
+            # intentionally short. If the phone fetches but cannot send/ACK, the
+            # next MessengerBotR poll retries instead of losing the alert.
+            leases[key] = now_epoch + 8.0
             board_items.append(item)
 
         delivery["leases"] = leases
@@ -11159,7 +11159,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             "👥 파티편성\n!무스펠 / !성역3 / !성역4 / !비탄\n\n"
             "👥 기타\n!인원\n!비교\n!앱\n\n"
             "🔔 알림\n!알림켜기 / !알림끄기 / !알림상태\n"
-            "!방이름 / !봇상태 / !알림진단 / !알림테스트 / !알림기본\n"
+            "!방이름 / !봇상태 / !알림진단 / !알림큐 / !알림테스트 / !알림기본\n"
             "!알림30테스트 / !알림10테스트 / !콘텐츠30테스트 / !콘텐츠10테스트 / !아그로변경테스트\n"
             "기본: 모든 일정 30분 전 + 10분 전\n"
             "시간 수정: !아그로 06:00 / !시공 20:00\n"
@@ -11245,11 +11245,36 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             text = (
                 f"🧪 {labels.get(scenario, '자동알림')} 테스트 등록 완료\n\n"
                 "메신저봇R 자동 폴링이 정상이라면 30초 안에 별도 테스트 알림이 1개 옵니다. "
-                "테스트는 5분 동안 재시도됩니다."
+                "전송/ACK가 실패해도 15초 주기로 다시 시도합니다."
             )
         else:
             text = "⚠️ 알림 테스트 등록 실패"
         return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+
+    if body == "알림큐":
+        state = _load_openchat_alert_state()
+        _key, delivery = _openchat_get_delivery(state, room)
+        now_epoch = time.time()
+        tests = [x for x in (delivery.get("testQueue") or []) if isinstance(x, dict)]
+        leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
+        active_leases = {str(k): max(0, int(float(v) - now_epoch)) for k, v in leases.items() if _alert_float(v, 0.0) > now_epoch}
+        sent_count = len([x for x in (delivery.get("sentKeys") or []) if str(x)])
+        lines = [
+            "🧪 자동알림 큐 진단",
+            "",
+            f"방: {display_room or _openchat_room_key(room) or '(미확인)'}",
+            f"테스트 대기: {len(tests)}개",
+            f"활성 lease: {len(active_leases)}개",
+            f"ACK 완료 누적: {sent_count}개",
+            f"마지막 폴링: {str(delivery.get('lastPollAt') or '없음')}",
+        ]
+        if tests:
+            newest = tests[-1]
+            lines.append(f"최근 테스트: {str(newest.get('scenario') or 'generic')} / {str(newest.get('key') or '')[-18:]}")
+        if active_leases:
+            sample_key = next(iter(active_leases.keys()))
+            lines.append(f"lease 남음: {active_leases[sample_key]}초")
+        return PlainTextResponse("\n".join(lines), media_type="text/plain; charset=utf-8")
 
     if body == "알림진단":
         try:
