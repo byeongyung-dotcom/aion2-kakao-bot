@@ -8053,7 +8053,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V9 FINAL"
+PWA_APP_VERSION = "V10 MESSENGER FINAL"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -8727,7 +8727,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v9-final"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v10-messenger-final"}
 
 
 @app.get("/manifest.webmanifest")
@@ -9202,15 +9202,28 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             if pending and str(pending.get("key") or ""):
                 shift = int(pending.get("shiftMinutes") or 0)
                 sign = "+" if shift > 0 else ""
+                old_time = str(pending.get("oldTime") or "")
+                new_time = str(pending.get("newTime") or "")
+                next_agro_text = str(pending.get("nextAgro") or "")
+                notice_title = str(pending.get("title") or "")
+                maintenance_message = (
+                    "🔧 아그로 시간 변경\n\n"
+                    f"점검 종료: {old_time} → {new_time}\n"
+                    f"변경폭: {sign}{shift}분\n"
+                    f"다음 아그로: {next_agro_text}"
+                )
+                if notice_title:
+                    maintenance_message += f"\n\n공지: {notice_title}"
                 items.append({
                     "type": "maintenance_change",
                     "title": "아그로 시간 변경",
-                    "oldTime": str(pending.get("oldTime") or ""),
-                    "newTime": str(pending.get("newTime") or ""),
+                    "message": maintenance_message,
+                    "oldTime": old_time,
+                    "newTime": new_time,
                     "shiftMinutes": shift,
                     "shiftText": f"{sign}{shift}분",
-                    "nextAgro": str(pending.get("nextAgro") or ""),
-                    "noticeTitle": str(pending.get("title") or ""),
+                    "nextAgro": next_agro_text,
+                    "noticeTitle": notice_title,
                     "key": str(pending.get("key") or ""),
                 })
         except Exception:
@@ -9233,13 +9246,74 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
         newest_test = valid_tests[0][1] if valid_tests else None
         delivery["testQueue"] = [newest_test] if newest_test else []
         if newest_test:
-            items.append({
-                "type": "test",
-                "title": "알림 시스템 테스트",
-                "time": now.strftime("%H:%M"),
-                "alertMinutes": 0,
-                "key": str(newest_test.get("key") or ""),
-            })
+            scenario = str(newest_test.get("scenario") or "generic").strip().lower()
+            test_key = str(newest_test.get("key") or "")
+            if scenario == "boss30":
+                test_target = now + timedelta(minutes=30)
+                items.append({
+                    "type": "boss",
+                    "boss": "정령왕 아그로 (30분 테스트)",
+                    "time": test_target.strftime("%H:%M"),
+                    "alertMinutes": 30,
+                    "remainingMinutes": 30,
+                    "key": test_key,
+                })
+            elif scenario == "boss10":
+                test_target = now + timedelta(minutes=10)
+                items.append({
+                    "type": "boss",
+                    "boss": "정령왕 아그로 (10분 테스트)",
+                    "time": test_target.strftime("%H:%M"),
+                    "alertMinutes": 10,
+                    "remainingMinutes": 10,
+                    "key": test_key,
+                })
+            elif scenario == "content30":
+                test_target = now + timedelta(minutes=30)
+                items.append({
+                    "type": "content",
+                    "content": "시공쟁탈전 (30분 테스트)",
+                    "time": test_target.strftime("%H:%M"),
+                    "alertMinutes": 30,
+                    "remainingMinutes": 30,
+                    "key": test_key,
+                })
+            elif scenario == "content10":
+                test_target = now + timedelta(minutes=10)
+                items.append({
+                    "type": "content",
+                    "content": "시공쟁탈전 (10분 테스트)",
+                    "time": test_target.strftime("%H:%M"),
+                    "alertMinutes": 10,
+                    "remainingMinutes": 10,
+                    "key": test_key,
+                })
+            elif scenario == "agrochange":
+                items.append({
+                    "type": "maintenance_change",
+                    "title": "아그로 시간 변경 테스트",
+                    "message": (
+                        "🔧 아그로 시간 변경 테스트\n\n"
+                        "점검 종료: 07:00 → 08:00\n"
+                        "변경폭: +60분\n"
+                        "다음 아그로: 테스트 일정"
+                    ),
+                    "oldTime": "07:00",
+                    "newTime": "08:00",
+                    "shiftMinutes": 60,
+                    "shiftText": "+60분",
+                    "nextAgro": "테스트 일정",
+                    "noticeTitle": "테스트 점검 공지",
+                    "key": test_key,
+                })
+            else:
+                items.append({
+                    "type": "test",
+                    "title": "알림 시스템 테스트",
+                    "time": now.strftime("%H:%M"),
+                    "alertMinutes": 0,
+                    "key": test_key,
+                })
 
         # Scheduled alerts are recomputed every poll and are NOT consumed.
         targets = _schedule_alert_targets(now)
@@ -11038,7 +11112,7 @@ async def _format_openchat_alert_diagnostic(room: str = "", room_label: str = ""
     return "\n".join(lines)
 
 
-def _queue_openchat_test_alert(room: str):
+def _queue_openchat_test_alert(room: str, scenario: str = "generic"):
     room_key = _openchat_room_key(room)
     if not room_key:
         return False
@@ -11046,10 +11120,15 @@ def _queue_openchat_test_alert(room: str):
         state = _load_openchat_alert_state()
         _, delivery = _openchat_get_delivery(state, room)
         nonce = int(time.time() * 1000)
-        key = f"TEST|{room_key}|{nonce}"
+        scenario_key = re.sub(r"[^0-9A-Za-z_-]", "", str(scenario or "generic"))[:40] or "generic"
+        key = f"TEST|{room_key}|{scenario_key}|{nonce}"
         # Keep only the newest test alert for this room.
-        # Re-running !알림테스트 replaces any still-retryable older test.
-        delivery["testQueue"] = [{"key": key, "created": time.time()}]
+        # Re-running a test replaces any still-retryable older test.
+        delivery["testQueue"] = [{
+            "key": key,
+            "created": time.time(),
+            "scenario": scenario_key,
+        }]
         state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
         return _save_openchat_alert_state(state)
     except Exception:
@@ -11081,6 +11160,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             "👥 기타\n!인원\n!비교\n!앱\n\n"
             "🔔 알림\n!알림켜기 / !알림끄기 / !알림상태\n"
             "!방이름 / !봇상태 / !알림진단 / !알림테스트 / !알림기본\n"
+            "!알림30테스트 / !알림10테스트 / !콘텐츠30테스트 / !콘텐츠10테스트 / !아그로변경테스트\n"
             "기본: 모든 일정 30분 전 + 10분 전\n"
             "시간 수정: !아그로 06:00 / !시공 20:00\n"
             "알림 수정: !아그로 25분전 / !시공 25분전 10분전",
@@ -11142,10 +11222,31 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             media_type="text/plain; charset=utf-8",
         )
 
-    if body == "알림테스트":
-        ok = _queue_openchat_test_alert(room)
+    if body in ("알림테스트", "알림30테스트", "알림10테스트", "콘텐츠30테스트", "콘텐츠10테스트", "아그로변경테스트"):
+        scenario_map = {
+            "알림테스트": "generic",
+            "알림30테스트": "boss30",
+            "알림10테스트": "boss10",
+            "콘텐츠30테스트": "content30",
+            "콘텐츠10테스트": "content10",
+            "아그로변경테스트": "agrochange",
+        }
+        scenario = scenario_map.get(body, "generic")
+        ok = _queue_openchat_test_alert(room, scenario=scenario)
         if ok:
-            text = "🧪 알림 테스트 등록 완료\n\n자동 폴링이 정상이라면 30초 안에 별도 테스트 알림이 1개 옵니다. 테스트는 5분 동안 재시도됩니다."
+            labels = {
+                "generic": "일반 자동알림",
+                "boss30": "필드보스 30분 전",
+                "boss10": "필드보스 10분 전",
+                "content30": "콘텐츠 30분 전",
+                "content10": "콘텐츠 10분 전",
+                "agrochange": "아그로 점검 시간 변경",
+            }
+            text = (
+                f"🧪 {labels.get(scenario, '자동알림')} 테스트 등록 완료\n\n"
+                "메신저봇R 자동 폴링이 정상이라면 30초 안에 별도 테스트 알림이 1개 옵니다. "
+                "테스트는 5분 동안 재시도됩니다."
+            )
         else:
             text = "⚠️ 알림 테스트 등록 실패"
         return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
