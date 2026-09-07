@@ -9142,6 +9142,257 @@ h2{{margin:0 0 12px}}p{{color:#d1d5db;line-height:1.6}}a{{color:#93c5fd}}
 </html>"""
     return HTMLResponse(html)
 
+
+# =========================================================
+# YUNBOT V8 common schedule snapshot
+#
+# MessengerBotR V8 keeps one server bridge (YUNBOT), while
+# each registered Kakao room keeps its own local schedule offset
+# and alert lead times.  This endpoint exposes only the COMMON
+# server schedule.  Room-specific corrections never mutate it.
+# =========================================================
+
+YUNBOT_SNAPSHOT_VERSION = "v8-room-schedule-2026-09-07"
+
+
+def _yunbot_v8_occurrence(dt):
+    if dt is None:
+        return None
+    try:
+        local = dt.astimezone(KST)
+    except Exception:
+        local = dt
+    return {
+        "epochMs": int(local.timestamp() * 1000),
+        "iso": local.isoformat(),
+        "date": local.strftime("%m/%d"),
+        "time": local.strftime("%H:%M"),
+        "hour": int(local.hour),
+        "minute": int(local.minute),
+    }
+
+
+def _yunbot_v8_daily_occurrences(times, now=None):
+    now = now or datetime.now(KST)
+    out = []
+    seen = set()
+    clean = []
+    for item in (times or []):
+        try:
+            h, m = int(item[0]), int(item[1])
+        except Exception:
+            continue
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            clean.append((h, m))
+    for day_delta in (-1, 0, 1, 2):
+        day = now + timedelta(days=day_delta)
+        for h, m in clean:
+            dt = day.replace(hour=h, minute=m, second=0, microsecond=0)
+            key = int(dt.timestamp())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dt)
+    out.sort()
+    return out
+
+
+def _yunbot_v8_weekly_occurrences(weekdays, times, now=None):
+    now = now or datetime.now(KST)
+    day_set = set()
+    for value in (weekdays or []):
+        try:
+            day_set.add(int(value))
+        except Exception:
+            pass
+    clean_times = []
+    for item in (times or []):
+        try:
+            h, m = int(item[0]), int(item[1])
+        except Exception:
+            continue
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            clean_times.append((h, m))
+
+    out = []
+    seen = set()
+    # One week behind + slightly more than one week ahead.  The past
+    # occurrence is needed when a room correction shifts an event later
+    # than the common clock (e.g. 20:00 common -> 20:12 room-specific).
+    for day_delta in range(-8, 10):
+        day = now + timedelta(days=day_delta)
+        if int(day.weekday()) not in day_set:
+            continue
+        for h, m in clean_times:
+            dt = day.replace(hour=h, minute=m, second=0, microsecond=0)
+            key = int(dt.timestamp())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dt)
+    out.sort()
+    return out
+
+
+def _yunbot_v8_agro_occurrences(anchor, now=None):
+    now = now or datetime.now(KST)
+    if anchor is None:
+        return []
+    try:
+        interval_hours = max(1, int(BOSS_RULES.get("agroIntervalHours", 4)))
+    except Exception:
+        interval_hours = 4
+    interval = timedelta(hours=interval_hours)
+    interval_seconds = interval.total_seconds()
+    try:
+        steps = int((now - anchor).total_seconds() // interval_seconds)
+    except Exception:
+        steps = 0
+
+    out = []
+    seen = set()
+    # Keep several previous/future occurrences so local room offsets can
+    # cross the common event clock without disappearing after that clock.
+    for i in range(steps - 3, steps + 10):
+        dt = anchor + interval * i
+        key = int(dt.timestamp())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dt)
+    out.sort()
+    return out
+
+
+def _yunbot_v8_pack_schedule(key, name, item_type, occurrences):
+    packed = []
+    for dt in occurrences or []:
+        row = _yunbot_v8_occurrence(dt)
+        if row:
+            packed.append(row)
+    return {
+        "key": str(key),
+        "name": str(name),
+        "type": str(item_type),
+        "occurrences": packed,
+    }
+
+
+@app.get("/openchat/schedule-snapshot")
+async def openchat_schedule_snapshot(room: str = "YUNBOT", room_alias: str = "윤이봇"):
+    """Return the common schedule used by YUNBOT V8.
+
+    This route deliberately contains no per-Kakao-room override state.
+    MessengerBotR stores room-specific clock offsets and alert lead times
+    locally and resets only those clock offsets when `generation` changes.
+    """
+    now = datetime.now(KST)
+    try:
+        await refresh_boss_rules()
+    except Exception:
+        pass
+
+    try:
+        common_agro_anchor = await latest_maintenance_anchor()
+    except Exception:
+        common_agro_anchor = _persisted_official_agro_anchor() or AGRO_FALLBACK_ANCHOR
+
+    official_info = _persisted_official_agro_info()
+    official_anchor = official_info.get("anchor")
+    source_id = str(official_info.get("sourceId") or "")
+    source_title = str(official_info.get("sourceTitle") or "")
+
+    generation_anchor = official_anchor or common_agro_anchor or AGRO_FALLBACK_ANCHOR
+    generation = source_id
+    if generation_anchor is not None:
+        generation = (generation + "|" if generation else "") + generation_anchor.astimezone(KST).strftime("%Y%m%d%H%M")
+    if not generation:
+        generation = "fallback"
+
+    schedules = []
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "agro", "정령왕 아그로", "boss",
+        _yunbot_v8_agro_occurrences(common_agro_anchor, now),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "kaira", "감시자 카이라", "boss",
+        _yunbot_v8_daily_occurrences(_kaira_times(), now),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "nahma", "수호신장 나흐마", "boss",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("nahmaWeekdays") or [],
+            [(BOSS_RULES.get("nahmaHour", 0), BOSS_RULES.get("nahmaMinute", 0))],
+            now,
+        ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "abyss", "어비스 보스", "boss",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("abyssWeekdays") or [],
+            [(BOSS_RULES.get("abyssHour", 0), BOSS_RULES.get("abyssMinute", 0))],
+            now,
+        ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "sigong", "시공쟁탈전", "content",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("sigongWeekdays") or [],
+            BOSS_RULES.get("sigongTimes") or [],
+            now,
+        ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "gyunyeol", "균열지대", "content",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("gyunyeolWeekdays") or [],
+            BOSS_RULES.get("gyunyeolTimes") or [],
+            now,
+        ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "ati", "아티쟁", "content",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("atiWeekdays") or [],
+            BOSS_RULES.get("atiTimes") or [],
+            now,
+        ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "fieldboss", "필드보스", "boss",
+        _yunbot_v8_weekly_occurrences(
+            BOSS_RULES.get("fieldBossWeekdays") or [],
+            BOSS_RULES.get("fieldBossTimes") or [],
+            now,
+        ),
+    ))
+
+    return {
+        "ok": True,
+        "version": YUNBOT_SNAPSHOT_VERSION,
+        "bridge": _openchat_room_key(room) or "YUNBOT",
+        "alias": _openchat_room_key(room_alias) or "윤이봇",
+        "nowEpochMs": int(now.timestamp() * 1000),
+        "nowIso": now.isoformat(),
+        "generation": generation,
+        "maintenance": {
+            "sourceId": source_id,
+            "sourceTitle": source_title,
+            "officialAnchor": official_anchor.astimezone(KST).isoformat() if official_anchor else "",
+            "commonAgroAnchor": common_agro_anchor.astimezone(KST).isoformat() if common_agro_anchor else "",
+        },
+        "schedules": schedules,
+    }
+
+
 @app.get("/openchat/alerts")
 async def openchat_alerts(room: str = "", room_alias: str = ""):
     """Single-delivery polling endpoint.
