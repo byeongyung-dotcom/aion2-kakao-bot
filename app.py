@@ -8077,7 +8077,7 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px}
 .install{border:1px solid #5966a6;background:#1a2440;color:#fff;border-radius:12px;padding:11px 15px;font-weight:700;cursor:pointer}
 .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{background:linear-gradient(180deg,#161f34,#11182a);border:1px solid var(--line);border-radius:18px;padding:17px;box-shadow:0 16px 45px #0004}.card h2{font-size:16px;margin:0 0 13px}.search{display:grid;grid-template-columns:1fr 150px auto;gap:9px}input,select{width:100%;border:1px solid #34415f;background:#0d1424;color:#fff;border-radius:12px;padding:13px;font-size:16px;outline:none}input:focus,select:focus{border-color:var(--blue)}
-.dashboard{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}.dashitem{min-height:105px;border:1px solid #2f3b5a;background:linear-gradient(160deg,#141e34,#0f1729);border-radius:15px;padding:13px;cursor:pointer}.dashitem:active{transform:scale(.99)}.dashtitle{font-size:11px;color:#8fa0bc;margin-bottom:8px}.dashvalue{font-size:17px;font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashsub{font-size:11px;color:#8493ad;margin-top:7px;line-height:1.35;min-height:28px}.dashgood{color:#74e8bd}.dashwarn{color:#ffd479}.dashbad{color:#ff9aa9}.favtools{display:flex;gap:6px;margin-top:8px}.favmini{flex:1;border:1px solid #354363;background:#111a2e;color:#eaf0ff;border-radius:8px;padding:6px 7px;font-size:10px;font-weight:750;cursor:pointer}
+.dashboard{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}.dashitem{min-height:105px;border:1px solid #2f3b5a;background:linear-gradient(160deg,#141e34,#0f1729);border-radius:15px;padding:13px;cursor:pointer}.dashitem:active{transform:scale(.99)}.dashtitle{font-size:11px;color:#8fa0bc;margin-bottom:8px}.dashvalue{font-size:17px;font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashsub{font-size:11px;color:#8493ad;margin-top:7px;line-height:1.35;min-height:28px}.countdown{font-variant-numeric:tabular-nums;letter-spacing:.2px}.favbosschips{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.favbosschip{border:1px solid #354363;background:#10192b;color:#cbd7ef;border-radius:999px;padding:4px 7px;font-size:9px;line-height:1.1}.dashgood{color:#74e8bd}.dashwarn{color:#ffd479}.dashbad{color:#ff9aa9}.favtools{display:flex;gap:6px;margin-top:8px}.favmini{flex:1;border:1px solid #354363;background:#111a2e;color:#eaf0ff;border-radius:8px;padding:6px 7px;font-size:10px;font-weight:750;cursor:pointer}
 .primary{border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;border-radius:12px;padding:0 17px;font-weight:800;font-size:15px;cursor:pointer}.actions{display:flex;gap:9px;margin-top:10px}.ghost{flex:1;border:1px solid #3a4868;background:#111a2e;color:#eaf0ff;border-radius:11px;padding:11px;font-weight:700;cursor:pointer}
 .section{margin-top:16px}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.btn{border:1px solid #34415e;background:#121b2e;color:#eef3ff;border-radius:12px;padding:13px 8px;font-size:14px;font-weight:750;cursor:pointer;min-height:48px}.btn:active,.ghost:active,.primary:active{transform:scale(.985)}.btn.feature{border-color:#4d5b93;background:#182341}.btn.news{border-color:#405f64;background:#13282d}
 .result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
@@ -8102,10 +8102,22 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
       <div id="dashNextName" class="dashvalue">불러오는 중…</div>
       <div id="dashNextTime" class="dashsub">알림 일정을 확인합니다.</div>
     </div>
+    <div id="dashFavBossCard" class="dashitem">
+      <div class="dashtitle">⭐ 즐겨찾기 보스</div>
+      <div id="dashFavBossName" class="dashvalue">불러오는 중…</div>
+      <div id="dashFavBossTime" class="dashsub countdown">즐겨찾기 일정을 확인합니다.</div>
+      <div id="dashFavBossChips" class="favbosschips"></div>
+      <div class="favtools"><button id="favBossCfgBtn" class="favmini">설정</button><button id="favBossOpenBtn" class="favmini">바로 보기</button></div>
+    </div>
     <div id="dashHealthCard" class="dashitem">
       <div class="dashtitle">🛡️ 알림 감시</div>
       <div id="dashHealth" class="dashvalue">확인 중…</div>
       <div id="dashHealthSub" class="dashsub">외부 1분 체크 상태</div>
+    </div>
+    <div id="dashPushCard" class="dashitem">
+      <div class="dashtitle">🔔 이 태블릿 알림</div>
+      <div id="dashPush" class="dashvalue">확인 중…</div>
+      <div id="dashPushSub" class="dashsub">푸시 구독 상태</div>
     </div>
     <div id="dashRecent" class="dashitem">
       <div class="dashtitle">🧾 최근 알림</div>
@@ -8184,8 +8196,23 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
       </div>
 
       <div class="card section">
-        <h2>🐲 필드보스 / 콘텐츠</h2>
-        <div class="buttons">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px"><h2 style="margin:0">🐲 필드보스 / 콘텐츠</h2><button id="favBossInlineBtn" class="notifybtn" style="padding:7px 10px;font-size:11px">⭐ 즐겨찾기 설정</button></div>
+        <div id="favBossSettingsBox" class="settingsbox">
+          <div class="settingshead"><b>홈 즐겨찾기 보스</b><span style="font-size:11px;color:#7f8da8">최대 4개</span></div>
+          <div class="checkgrid">
+            <label class="checkchip"><input data-favboss="agro" type="checkbox">아그로</label>
+            <label class="checkchip"><input data-favboss="kaira" type="checkbox">카이라</label>
+            <label class="checkchip"><input data-favboss="nahma" type="checkbox">나흐마</label>
+            <label class="checkchip"><input data-favboss="abyss" type="checkbox">어비스</label>
+            <label class="checkchip"><input data-favboss="sigong" type="checkbox">시공</label>
+            <label class="checkchip"><input data-favboss="gyunyeol" type="checkbox">균열</label>
+            <label class="checkchip"><input data-favboss="ati" type="checkbox">아티</label>
+            <label class="checkchip"><input data-favboss="fieldboss" type="checkbox">필드보스</label>
+          </div>
+          <button id="saveFavBoss" class="saveprefs">즐겨찾기 저장</button>
+          <div class="nextline">선택한 일정 중 가장 가까운 일정이 홈에서 초 단위로 표시됩니다.</div>
+        </div>
+        <div class="buttons" style="margin-top:13px">
           <button class="btn feature" data-cmd="필보">필보 전체</button>
           <button class="btn" data-cmd="아그로">아그로</button>
           <button class="btn" data-cmd="카이라">카이라</button>
@@ -8248,6 +8275,54 @@ $('rankingBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName'
 ['charName','serverName'].forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter')$('detailBtn').click()}));
 
 const FAV_CHARACTER_KEY='aion2.tool.favorite.character.v1';
+const FAV_BOSS_KEY='aion2.tool.favorite.bosses.v1';
+const BOSS_META={
+  agro:{name:'정령왕 아그로',short:'아그로',cmd:'아그로'},
+  kaira:{name:'감시자 카이라',short:'카이라',cmd:'카이라'},
+  nahma:{name:'수호신장 나흐마',short:'나흐마',cmd:'나흐마'},
+  abyss:{name:'어비스 보스',short:'어비스',cmd:'어비스'},
+  sigong:{name:'시공쟁탈전',short:'시공',cmd:'시공'},
+  gyunyeol:{name:'균열지대',short:'균열',cmd:'균열'},
+  ati:{name:'아티쟁',short:'아티',cmd:'아티'},
+  fieldboss:{name:'필드보스',short:'필드보스',cmd:'필보'}
+};
+let latestNextItems=[];
+let dashNextTargetIso='';
+let dashFavBossTargetIso='';
+let dashFavBossKey='';
+function scheduleKeyFromName(name){for(const [k,v] of Object.entries(BOSS_META)){if(v.name===name)return k}return ''}
+function getFavoriteBosses(){
+  try{const x=JSON.parse(localStorage.getItem(FAV_BOSS_KEY)||'null');if(Array.isArray(x)&&x.length)return x.filter(k=>BOSS_META[k]).slice(0,4)}catch(e){}
+  return ['agro','fieldboss','kaira'];
+}
+function renderFavBossChecks(){const selected=new Set(getFavoriteBosses());document.querySelectorAll('[data-favboss]').forEach(el=>el.checked=selected.has(el.dataset.favboss));renderFavBossChips();}
+function renderFavBossChips(){const el=$('dashFavBossChips');if(!el)return;el.innerHTML='';for(const k of getFavoriteBosses()){const chip=document.createElement('span');chip.className='favbosschip';chip.textContent=BOSS_META[k].short;el.append(chip)}}
+function saveFavoriteBosses(){
+  const selected=[...document.querySelectorAll('[data-favboss]:checked')].map(el=>el.dataset.favboss);
+  if(!selected.length)return toast('즐겨찾기 보스를 1개 이상 선택해 주세요.');
+  if(selected.length>4)return toast('즐겨찾기는 최대 4개까지 가능합니다.');
+  localStorage.setItem(FAV_BOSS_KEY,JSON.stringify(selected));renderFavBossChips();updateFavoriteBossDashboard();$('favBossSettingsBox').classList.remove('open');toast('즐겨찾기 보스를 저장했습니다.');
+}
+function formatCountdown(iso){
+  if(!iso)return '';
+  const ms=new Date(iso).getTime()-Date.now(); if(!Number.isFinite(ms))return '';
+  const total=Math.max(0,Math.floor(ms/1000)),d=Math.floor(total/86400),h=Math.floor(total%86400/3600),m=Math.floor(total%3600/60),sec=total%60;
+  if(d>0)return d+'일 '+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');
+  return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');
+}
+function updateFavoriteBossDashboard(){
+  const fav=new Set(getFavoriteBosses());
+  const rows=latestNextItems.filter(x=>x.enabled!==false&&fav.has(scheduleKeyFromName(x.name))).sort((a,b)=>(a.targetTs||0)-(b.targetTs||0));
+  const x=rows[0]; renderFavBossChips();
+  if(!x){$('dashFavBossName').textContent='예정 없음';$('dashFavBossTime').textContent='즐겨찾기 일정이 없습니다.';dashFavBossTargetIso='';dashFavBossKey='';return}
+  dashFavBossKey=scheduleKeyFromName(x.name);dashFavBossTargetIso=x.targetIso||'';$('dashFavBossName').textContent=BOSS_META[dashFavBossKey]?.short||x.name;
+  $('dashFavBossTime').textContent=(x.time||'')+(dashFavBossTargetIso?' · '+formatCountdown(dashFavBossTargetIso):'');
+}
+function tickDashboardCountdowns(){
+  if(dashNextTargetIso){const x=latestNextItems.find(v=>v.targetIso===dashNextTargetIso);$('dashNextTime').textContent=(x?.time||'')+' · '+formatCountdown(dashNextTargetIso)+' 후'+((x?.leads||[]).length?' · '+x.leads.map(v=>v+'분 전').join(' / '):'')}
+  if(dashFavBossTargetIso){const x=latestNextItems.find(v=>v.targetIso===dashFavBossTargetIso);$('dashFavBossTime').textContent=(x?.time||'')+' · '+formatCountdown(dashFavBossTargetIso)+' 후'}
+}
+
 function getFavoriteCharacter(){
   try{const x=JSON.parse(localStorage.getItem(FAV_CHARACTER_KEY)||'null');if(x&&x.name&&x.server)return x}catch(e){}
   return {name:$('charName').value.trim()||'윤이',server:$('serverName').value.trim()||'지켈'};
@@ -8261,6 +8336,12 @@ $('favSaveBtn').onclick=()=>{
   localStorage.setItem(FAV_CHARACTER_KEY,JSON.stringify({name,server}));renderFavoriteCharacter();toast('즐겨찾기 캐릭터를 저장했습니다.');
 };
 $('favOpenBtn').onclick=()=>{const x=getFavoriteCharacter();location.href='/detail?name='+encodeURIComponent(x.name)+'&server='+encodeURIComponent(x.server)};
+$('favBossCfgBtn').onclick=()=>{$('favBossSettingsBox').classList.toggle('open');renderFavBossChecks();$('favBossSettingsBox').scrollIntoView({behavior:'smooth',block:'center'});};
+$('favBossInlineBtn').onclick=()=>{$('favBossSettingsBox').classList.toggle('open');renderFavBossChecks();};
+$('saveFavBoss').onclick=saveFavoriteBosses;
+$('favBossOpenBtn').onclick=()=>{if(dashFavBossKey&&BOSS_META[dashFavBossKey])run(BOSS_META[dashFavBossKey].cmd);else run('필보')};
+$('dashFavBossCard').onclick=e=>{if(e.target.closest('button'))return;if(dashFavBossKey&&BOSS_META[dashFavBossKey])run(BOSS_META[dashFavBossKey].cmd)};
+renderFavBossChips();
 
 async function refreshDashboard(){
   try{
@@ -8269,14 +8350,17 @@ async function refreshDashboard(){
       fetch('/api/push/diagnostics',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
       fetch('/api/push/history',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}))
     ]);
-    const next=(nextRes.items||[]).find(x=>x.enabled!==false)||(nextRes.items||[])[0];
+    latestNextItems=(nextRes.items||[]).map(x=>Object.assign({},x,{targetTs:x.targetIso?new Date(x.targetIso).getTime():Date.now()+(Number(x.minutes)||0)*60000}));
+    const next=latestNextItems.find(x=>x.enabled!==false)||latestNextItems[0];
     if(next){
       $('dashNextName').textContent=next.name||'다음 일정';
+      dashNextTargetIso=next.targetIso||'';
       const leads=(next.leads||[]).map(v=>v+'분 전').join(' / ');
-      $('dashNextTime').textContent=(next.time||'')+(next.minutes!=null?' · '+next.minutes+'분 후':'')+(leads?' · '+leads:'');
+      $('dashNextTime').textContent=(next.time||'')+(dashNextTargetIso?' · '+formatCountdown(dashNextTargetIso)+' 후':(next.minutes!=null?' · '+next.minutes+'분 후':''))+(leads?' · '+leads:'');
     }else{
-      $('dashNextName').textContent='예정 없음';$('dashNextTime').textContent='현재 예정된 알림 일정이 없습니다.';
+      dashNextTargetIso='';$('dashNextName').textContent='예정 없음';$('dashNextTime').textContent='현재 예정된 알림 일정이 없습니다.';
     }
+    updateFavoriteBossDashboard();
     const ok=!!healthRes.externalCronHealthy;
     $('dashHealth').textContent=ok?'정상 감시':'점검 필요';
     $('dashHealth').className='dashvalue '+(ok?'dashgood':'dashwarn');
@@ -8290,6 +8374,7 @@ async function refreshDashboard(){
 $('dashNext').onclick=()=>showNextAlerts();
 $('dashHealthCard').onclick=()=>showPushHealth();
 $('dashRecent').onclick=()=>showPushHistory();
+$('dashPushCard').onclick=()=>{$('notifySettingsBox').classList.add('open');$('notifySettingsBox').scrollIntoView({behavior:'smooth',block:'center'});};
 renderFavoriteCharacter();
 
 function b64ToU8(base64String){
@@ -8305,18 +8390,18 @@ async function getPushSubscription(){
   return await reg.pushManager.getSubscription();
 }
 async function updateNotifyState(){
-  const state=$('notifyState'), dot=$('notifyDot');
+  const state=$('notifyState'), dot=$('notifyDot'), dash=$('dashPush'), dashSub=$('dashPushSub');
   if(!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)){
-    state.textContent='이 기기에서 푸시 알림 미지원'; dot.classList.remove('on'); return;
+    state.textContent='이 기기에서 푸시 알림 미지원'; dot.classList.remove('on');dash.textContent='미지원';dash.className='dashvalue dashbad';dashSub.textContent='이 기기에서 Web Push 미지원';return;
   }
   const sub=await getPushSubscription().catch(()=>null);
   if(Notification.permission==='granted' && sub){
     fetch('/api/push/subscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({subscription:sub.toJSON(),label:'Galaxy Tablet PWA'})}).catch(()=>{});
-    state.textContent='알림 ON · 이 태블릿 등록됨'; dot.classList.add('on');
+    state.textContent='알림 ON · 이 태블릿 등록됨'; dot.classList.add('on');dash.textContent='ON';dash.className='dashvalue dashgood';dashSub.textContent='30분·10분 전 푸시 수신';
   }else if(Notification.permission==='denied'){
-    state.textContent='알림 차단됨 · Android 설정에서 허용 필요'; dot.classList.remove('on');
+    state.textContent='알림 차단됨 · Android 설정에서 허용 필요'; dot.classList.remove('on');dash.textContent='차단됨';dash.className='dashvalue dashbad';dashSub.textContent='Android 알림 권한 확인 필요';
   }else{
-    state.textContent='알림 OFF'; dot.classList.remove('on');
+    state.textContent='알림 OFF'; dot.classList.remove('on');dash.textContent='OFF';dash.className='dashvalue dashwarn';dashSub.textContent='알림 켜기를 눌러 등록';
   }
 }
 async function loadNotifyPrefs(){
@@ -8429,8 +8514,9 @@ async function disablePush(){
 $('notifyOnBtn').onclick=enablePush;
 $('notifyTestBtn').onclick=testPush;
 $('notifyOffBtn').onclick=disablePush;
-window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100)});
+window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100);setTimeout(renderFavBossChecks,1200)});
 setInterval(refreshDashboard,60000);
+setInterval(tickDashboardCountdowns,1000);
 
 let deferredPrompt=null;const installBtn=$('installBtn');
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
@@ -8457,7 +8543,7 @@ PWA_MANIFEST = {
     ]
 }
 
-PWA_SW = r"""const CACHE='aion2-tool-shell-v3';
+PWA_SW = r"""const CACHE='aion2-tool-shell-v4';
 const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});
@@ -9727,7 +9813,8 @@ async def pwa_push_next():
         key=_schedule_key(name)
         out.append({
             "type": typ, "name": name, "time": target.strftime("%m/%d %H:%M"),
-            "minutes": minutes, "enabled": bool((settings.get("schedule") or {}).get(key, True)),
+            "minutes": minutes, "targetIso": target.astimezone(KST).isoformat(),
+            "enabled": bool((settings.get("schedule") or {}).get(key, True)),
             "leads": settings.get("leads") or [30,10],
         })
     out.sort(key=lambda x: x["minutes"])
