@@ -8077,6 +8077,7 @@ body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-i
 h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px}
 .install{border:1px solid #5966a6;background:#1a2440;color:#fff;border-radius:12px;padding:11px 15px;font-weight:700;cursor:pointer}
 .grid{display:grid;grid-template-columns:1.15fr .85fr;gap:16px}.card{background:linear-gradient(180deg,#161f34,#11182a);border:1px solid var(--line);border-radius:18px;padding:17px;box-shadow:0 16px 45px #0004}.card h2{font-size:16px;margin:0 0 13px}.search{display:grid;grid-template-columns:1fr 150px auto;gap:9px}input,select{width:100%;border:1px solid #34415f;background:#0d1424;color:#fff;border-radius:12px;padding:13px;font-size:16px;outline:none}input:focus,select:focus{border-color:var(--blue)}
+.dashboard{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}.dashitem{min-height:105px;border:1px solid #2f3b5a;background:linear-gradient(160deg,#141e34,#0f1729);border-radius:15px;padding:13px;cursor:pointer}.dashitem:active{transform:scale(.99)}.dashtitle{font-size:11px;color:#8fa0bc;margin-bottom:8px}.dashvalue{font-size:17px;font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashsub{font-size:11px;color:#8493ad;margin-top:7px;line-height:1.35;min-height:28px}.dashgood{color:#74e8bd}.dashwarn{color:#ffd479}.dashbad{color:#ff9aa9}.favtools{display:flex;gap:6px;margin-top:8px}.favmini{flex:1;border:1px solid #354363;background:#111a2e;color:#eaf0ff;border-radius:8px;padding:6px 7px;font-size:10px;font-weight:750;cursor:pointer}
 .primary{border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:white;border-radius:12px;padding:0 17px;font-weight:800;font-size:15px;cursor:pointer}.actions{display:flex;gap:9px;margin-top:10px}.ghost{flex:1;border:1px solid #3a4868;background:#111a2e;color:#eaf0ff;border-radius:11px;padding:11px;font-weight:700;cursor:pointer}
 .section{margin-top:16px}.buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.btn{border:1px solid #34415e;background:#121b2e;color:#eef3ff;border-radius:12px;padding:13px 8px;font-size:14px;font-weight:750;cursor:pointer;min-height:48px}.btn:active,.ghost:active,.primary:active{transform:scale(.985)}.btn.feature{border-color:#4d5b93;background:#182341}.btn.news{border-color:#405f64;background:#13282d}
 .result{min-height:290px;white-space:pre-wrap;word-break:break-word;background:#0a101d;border:1px solid #28334c;border-radius:14px;padding:15px;color:#e9eefb;font-size:14px;line-height:1.55;overflow:auto}.result a{color:#6bbcff}.status{font-size:12px;color:var(--muted);margin-top:9px}.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#b9c6dc}.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 12px var(--good)}
@@ -8084,8 +8085,8 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
 .notifytools{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.notifytools .notifybtn{padding:8px 11px;font-size:12px}.settingsbox{display:none;margin-top:12px;padding:13px;border:1px solid #2d3a58;border-radius:13px;background:#0d1525}.settingsbox.open{display:block}.settingshead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.settingshead b{font-size:13px}.settinglabel{font-size:12px;color:#aebbd1;margin:11px 0 7px}.checkgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.checkchip{display:flex;align-items:center;gap:7px;border:1px solid #34415e;background:#121b2e;border-radius:10px;padding:9px 10px;font-size:12px;color:#eef3ff}.checkchip input{width:auto;margin:0;accent-color:#5a8cff}.saveprefs{width:100%;margin-top:12px;border:0;background:linear-gradient(135deg,var(--blue),var(--purple));color:#fff;border-radius:11px;padding:11px;font-weight:800}.nextline{font-size:11px;color:#8090aa;margin-top:8px}@media(max-width:600px){.checkgrid{grid-template-columns:repeat(2,1fr)}}
 .footer{text-align:center;color:#6f7e99;font-size:11px;padding:18px 0 3px}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:#202a44;border:1px solid #4a587c;border-radius:12px;padding:11px 15px;box-shadow:0 12px 40px #0008;display:none;z-index:50}
-@media(max-width:800px){.wrap{padding:15px}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
-@media(max-width:480px){.buttons{grid-template-columns:repeat(2,1fr)}h1{font-size:21px}.logo{width:48px;height:48px}.sub{max-width:230px}}
+@media(max-width:800px){.wrap{padding:15px}.dashboard{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.search{grid-template-columns:1fr 120px}.search .primary{grid-column:1/-1;height:46px}.buttons{grid-template-columns:repeat(3,1fr)}.top{align-items:flex-start}.install{padding:10px 12px}.result{min-height:220px}}
+@media(max-width:480px){.dashboard{grid-template-columns:1fr 1fr}.dashitem{min-height:96px}.buttons{grid-template-columns:repeat(2,1fr)}h1{font-size:21px}.logo{width:48px;height:48px}.sub{max-width:230px}}
 </style>
 </head>
 <body>
@@ -8094,6 +8095,30 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
     <div class="brand"><div class="logo">A2</div><div><h1>AION2 TOOL</h1><div class="sub">갤럭시탭 전용 · 기존 서버 기능 그대로</div></div></div>
     <button id="installBtn" class="install">앱 설치</button>
   </div>
+
+  <div class="dashboard">
+    <div id="dashNext" class="dashitem">
+      <div class="dashtitle">⏱️ 다음 일정</div>
+      <div id="dashNextName" class="dashvalue">불러오는 중…</div>
+      <div id="dashNextTime" class="dashsub">알림 일정을 확인합니다.</div>
+    </div>
+    <div id="dashHealthCard" class="dashitem">
+      <div class="dashtitle">🛡️ 알림 감시</div>
+      <div id="dashHealth" class="dashvalue">확인 중…</div>
+      <div id="dashHealthSub" class="dashsub">외부 1분 체크 상태</div>
+    </div>
+    <div id="dashRecent" class="dashitem">
+      <div class="dashtitle">🧾 최근 알림</div>
+      <div id="dashRecentTitle" class="dashvalue">아직 없음</div>
+      <div id="dashRecentTime" class="dashsub">전송 기록을 확인합니다.</div>
+    </div>
+    <div class="dashitem">
+      <div class="dashtitle">⭐ 즐겨찾기 캐릭터</div>
+      <div id="dashFav" class="dashvalue">윤이 · 지켈</div>
+      <div class="favtools"><button id="favSaveBtn" class="favmini">현재 저장</button><button id="favOpenBtn" class="favmini">바로 조회</button></div>
+    </div>
+  </div>
+
   <div class="grid">
     <div>
       <div class="card">
@@ -8221,6 +8246,51 @@ document.querySelectorAll('[data-open]').forEach(b=>b.addEventListener('click',(
 $('detailBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n||!s)return toast('캐릭터명과 서버를 입력해 주세요.');location.href='/detail?name='+encodeURIComponent(n)+'&server='+encodeURIComponent(s)};
 $('rankingBtn').onclick=()=>{const n=$('charName').value.trim(),s=$('serverName').value.trim();if(!n)return toast('캐릭터명을 입력해 주세요.');run('랭킹 '+n+(s||''))};
 ['charName','serverName'].forEach(id=>$(id).addEventListener('keydown',e=>{if(e.key==='Enter')$('detailBtn').click()}));
+
+const FAV_CHARACTER_KEY='aion2.tool.favorite.character.v1';
+function getFavoriteCharacter(){
+  try{const x=JSON.parse(localStorage.getItem(FAV_CHARACTER_KEY)||'null');if(x&&x.name&&x.server)return x}catch(e){}
+  return {name:$('charName').value.trim()||'윤이',server:$('serverName').value.trim()||'지켈'};
+}
+function renderFavoriteCharacter(){
+  const x=getFavoriteCharacter();$('dashFav').textContent=x.name+' · '+x.server;return x;
+}
+$('favSaveBtn').onclick=()=>{
+  const name=$('charName').value.trim(),server=$('serverName').value.trim();
+  if(!name||!server)return toast('캐릭터명과 서버를 입력해 주세요.');
+  localStorage.setItem(FAV_CHARACTER_KEY,JSON.stringify({name,server}));renderFavoriteCharacter();toast('즐겨찾기 캐릭터를 저장했습니다.');
+};
+$('favOpenBtn').onclick=()=>{const x=getFavoriteCharacter();location.href='/detail?name='+encodeURIComponent(x.name)+'&server='+encodeURIComponent(x.server)};
+
+async function refreshDashboard(){
+  try{
+    const [nextRes,healthRes,historyRes]=await Promise.all([
+      fetch('/api/push/next',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
+      fetch('/api/push/diagnostics',{cache:'no-store'}).then(r=>r.json()).catch(()=>({})),
+      fetch('/api/push/history',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}))
+    ]);
+    const next=(nextRes.items||[]).find(x=>x.enabled!==false)||(nextRes.items||[])[0];
+    if(next){
+      $('dashNextName').textContent=next.name||'다음 일정';
+      const leads=(next.leads||[]).map(v=>v+'분 전').join(' / ');
+      $('dashNextTime').textContent=(next.time||'')+(next.minutes!=null?' · '+next.minutes+'분 후':'')+(leads?' · '+leads:'');
+    }else{
+      $('dashNextName').textContent='예정 없음';$('dashNextTime').textContent='현재 예정된 알림 일정이 없습니다.';
+    }
+    const ok=!!healthRes.externalCronHealthy;
+    $('dashHealth').textContent=ok?'정상 감시':'점검 필요';
+    $('dashHealth').className='dashvalue '+(ok?'dashgood':'dashwarn');
+    const ext=healthRes.lastExternalMinutes;
+    $('dashHealthSub').textContent=(ext==null?'외부 체크 기록 없음':'외부 체크 '+ext+'분 전')+' · 등록 '+(healthRes.subscriptions||0)+'대';
+    const recent=(historyRes.items||[])[0];
+    if(recent){$('dashRecentTitle').textContent=recent.title||'알림';$('dashRecentTime').textContent=(recent.time||'')+' · '+String(recent.body||'').slice(0,35)}
+    else{$('dashRecentTitle').textContent='아직 없음';$('dashRecentTime').textContent='첫 자동 알림 전입니다.'}
+  }catch(e){}
+}
+$('dashNext').onclick=()=>showNextAlerts();
+$('dashHealthCard').onclick=()=>showPushHealth();
+$('dashRecent').onclick=()=>showPushHistory();
+renderFavoriteCharacter();
 
 function b64ToU8(base64String){
   const padding='='.repeat((4-base64String.length%4)%4);
@@ -8359,7 +8429,8 @@ async function disablePush(){
 $('notifyOnBtn').onclick=enablePush;
 $('notifyTestBtn').onclick=testPush;
 $('notifyOffBtn').onclick=disablePush;
-window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900)});
+window.addEventListener('load',()=>{setTimeout(updateNotifyState,700);setTimeout(loadNotifyPrefs,900);setTimeout(refreshDashboard,1100)});
+setInterval(refreshDashboard,60000);
 
 let deferredPrompt=null;const installBtn=$('installBtn');
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;installBtn.style.display='block'});
@@ -8386,7 +8457,7 @@ PWA_MANIFEST = {
     ]
 }
 
-PWA_SW = r"""const CACHE='aion2-tool-shell-v2';
+PWA_SW = r"""const CACHE='aion2-tool-shell-v3';
 const SHELL=['/','/manifest.webmanifest','/pwa/icon-192.png','/pwa/icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});
