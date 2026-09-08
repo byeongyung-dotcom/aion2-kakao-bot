@@ -157,10 +157,15 @@ def format_board_alert_title_only(board_type, title):
     title = str(title or "").strip()
 
     if board_type in ("notice", "공지"):
-        lowered = title.lower()
-        if "점검" in title:
+        lowered = title.casefold()
+        compact = re.sub(r"[^0-9a-z가-힣]+", "", lowered)
+        if "점검" in title or "maintenance" in lowered:
             header = "🔧 AION2 점검 공지"
-        elif "라이브" in title or "live" in lowered:
+        elif (
+            "라이브" in title or "생방송" in title or "생중계" in title or
+            "방송" in title or "live" in lowered or "onair" in compact or
+            "stream" in lowered or "쇼케이스" in title or "showcase" in lowered
+        ):
             header = "🔴 AION2 라이브 공지"
         else:
             header = "📢 AION2 공지"
@@ -7979,6 +7984,7 @@ async def fetch_board_latest(command: str, limit: int = 5):
             "id": str(content_id),
             "title": title,
             "date": date_text,
+            "postedAt": str(posted or ""),
             "link": link,
             "rawText": json.dumps(item, ensure_ascii=False),
         })
@@ -7988,18 +7994,80 @@ async def fetch_board_latest(command: str, limit: int = 5):
 
     return rows
 
+NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v2-20260908"
+
+
+def _classify_notice_kind(title):
+    """Return maintenance/live for notice posts we actually alert on."""
+    title_text = re.sub(r"\s+", " ", str(title or "")).strip()
+    lowered = title_text.casefold()
+    compact = re.sub(r"[^0-9a-z가-힣]+", "", lowered)
+
+    # Maintenance has priority if a title contains both kinds of words.
+    if "점검" in title_text or "maintenance" in lowered:
+        return "maintenance"
+
+    live_markers = (
+        "라이브",
+        "생방송",
+        "생중계",
+        "방송",
+        "live",
+        "on air",
+        "onair",
+        "streaming",
+        "stream",
+        "쇼케이스",
+        "showcase",
+    )
+    for marker in live_markers:
+        marker_low = marker.casefold()
+        if marker_low in lowered or re.sub(r"[^0-9a-z가-힣]+", "", marker_low) in compact:
+            return "live"
+
+    return None
+
+
+def _notice_header(kind):
+    if kind == "maintenance":
+        return "🔧 AION2 점검 공지"
+    if kind == "live":
+        return "🔴 AION2 라이브 공지"
+    return "📢 AION2 공지"
+
+
+def _board_post_is_recent(post, now=None, max_hours=36):
+    """Best-effort freshness check used only for one-time alert recovery."""
+    if not isinstance(post, dict):
+        return False
+    current = now or datetime.now(KST)
+    posted = _parse_kst_iso(post.get("postedAt"))
+    if posted is not None:
+        age = (current - posted).total_seconds() / 3600.0
+        return -1.0 <= age <= float(max_hours)
+    date_text = str(post.get("date") or "").strip()
+    try:
+        posted_date = datetime.strptime(date_text[:10], "%Y-%m-%d").date()
+        delta_days = (current.date() - posted_date).days
+        return 0 <= delta_days <= 1
+    except Exception:
+        return False
+
+
 def format_board_latest(command: str, rows):
     if command == "공지":
-        rows = [
-            r for r in rows
-            if "점검" in str(r.get("title") or "")
-        ]
-        if not rows:
-            return "🔧 AION2 점검 공지\n\n현재 확인되는 점검 공지가 없습니다."
+        matched = []
+        for row in rows:
+            kind = _classify_notice_kind(row.get("title") if isinstance(row, dict) else "")
+            if kind:
+                matched.append((row, kind))
 
-        row = rows[0]
+        if not matched:
+            return "📢 AION2 공지\n\n현재 확인되는 점검/라이브 공지가 없습니다."
+
+        row, kind = matched[0]
         return "\n".join([
-            "🔧 AION2 점검 공지",
+            _notice_header(kind),
             "",
             row["title"],
             "",
@@ -8038,7 +8106,8 @@ def format_board_latest(command: str, rows):
 
 async def board_lookup(command: str):
     cache_key = f"board:{command}"
-    cached = cache_get(cache_key, 300)
+    # Notice posts are time-sensitive; keep !공지 fresher than CM/update lookups.
+    cached = cache_get(cache_key, 60 if command == "공지" else 300)
     if cached:
         return cached
 
@@ -8850,6 +8919,7 @@ def _default_openchat_delivery_state():
         "lastPollAt": "",
         "lastAlias": "",
         "lastAckAt": "",
+        "noticeClassifierVersion": "",
         "maintenanceSourceId": "",
         "maintenanceAnchor": "",
         "maintenancePending": None,
@@ -8894,7 +8964,7 @@ def _normalize_openchat_delivery(raw):
             if str(key) and expiry_f > now_epoch - 60:
                 clean_leases[str(key)] = expiry_f
         out["leases"] = clean_leases
-    for field in ("lastPollAt", "lastAlias", "lastAckAt", "maintenanceSourceId", "maintenanceAnchor"):
+    for field in ("lastPollAt", "lastAlias", "lastAckAt", "noticeClassifierVersion", "maintenanceSourceId", "maintenanceAnchor"):
         if field in raw:
             out[field] = str(raw.get(field) or "")
     if isinstance(raw.get("maintenancePending"), dict):
@@ -9036,14 +9106,8 @@ def board_card_url(board_name, post_id):
     )
 
 def board_card_label(board_name, post_title=""):
-    title = str(post_title or "")
-    low = title.lower()
     if board_name == "공지":
-        if "점검" in title:
-            return "🔧 AION2 점검 공지"
-        if "라이브" in title or "live" in low:
-            return "🔴 AION2 라이브 공지"
-        return "📢 AION2 공지"
+        return _notice_header(_classify_notice_kind(post_title))
     if board_name == "CM":
         return "📢 AION2 CM"
     return "🆕 AION2 업데이트"
@@ -9688,22 +9752,16 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 for post in reversed(new_rows):
                     kind = None
                     if board == "공지":
-                        title = str(post.get("title") or "")
-                        low = title.lower()
-                        if "라이브" in title or "live" in low:
-                            kind = "live"
-                        elif "점검" in title:
-                            kind = "maintenance"
-                        else:
+                        kind = _classify_notice_kind(post.get("title") or "")
+                        if not kind:
                             continue
                     key = f"{board}:{post['id']}"
                     if key in known_pending:
                         continue
                     card_url = board_card_url(board, post["id"])
                     item = {
-                        # IMPORTANT: keep this out of the phone's old "board" text branch.
-                        # V8 phone code will fall through to item.message and send ONLY the URL,
-                        # exactly like character lookup, so Kakao renders the OG preview card.
+                        # Keep this out of the phone's old "board" text branch.
+                        # The V8 phone code falls through to item.message and sends the card URL.
                         "type": "board_card",
                         "board": board,
                         "kind": kind,
@@ -9716,6 +9774,36 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     }
                     pending.append({"created": now_epoch, "item": item})
                     known_pending.add(key)
+
+        # One-time classifier upgrade recovery. If an actual maintenance/live notice
+        # was missed by the old title matcher, recover the newest recent one once.
+        # ACK is still required before it is permanently marked sent.
+        if str(delivery.get("noticeClassifierVersion") or "") != NOTICE_ALERT_CLASSIFIER_VERSION:
+            sent_keys_for_recovery = set(str(x) for x in (delivery.get("sentKeys") or []) if str(x))
+            known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
+            notice_rows = latest_by_board.get("공지") or []
+            for post in notice_rows:
+                kind = _classify_notice_kind(post.get("title") or "")
+                if not kind or not _board_post_is_recent(post, now=now, max_hours=36):
+                    continue
+                key = f"공지:{post['id']}"
+                if key in sent_keys_for_recovery or key in known_pending:
+                    continue
+                card_url = board_card_url("공지", post["id"])
+                item = {
+                    "type": "board_card",
+                    "board": "공지",
+                    "kind": kind,
+                    "id": post["id"],
+                    "title": post["title"],
+                    "message": card_url,
+                    "cardUrl": card_url,
+                    "officialUrl": str(post.get("link") or ""),
+                    "key": key,
+                }
+                pending.append({"created": now_epoch, "item": item})
+                break
+            delivery["noticeClassifierVersion"] = NOTICE_ALERT_CLASSIFIER_VERSION
 
         delivery["boardPending"] = pending[-100:]
 
