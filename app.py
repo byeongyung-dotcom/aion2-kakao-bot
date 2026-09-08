@@ -7940,7 +7940,8 @@ async def fetch_board_latest(command: str, limit: int = 5):
         url,
         params={
             "isVote": "true",
-            "moreSize": "18",
+            # Ask for enough rows that pinned/fixed notices cannot hide a new post.
+            "moreSize": str(max(18, min(50, int(limit or 18)))),
             "moreDirection": "BEFORE",
             "previousArticleId": "0",
         },
@@ -7989,12 +7990,22 @@ async def fetch_board_latest(command: str, limit: int = 5):
             "rawText": json.dumps(item, ensure_ascii=False),
         })
 
-        if len(rows) >= limit:
-            break
+    # The board API may place pinned/fixed posts before newer normal posts.
+    # Always normalize to real publication time before lastSeen/new-post logic.
+    def _sort_epoch(row):
+        dt = _parse_kst_iso((row or {}).get("postedAt"))
+        if dt is not None:
+            return dt.timestamp()
+        try:
+            return datetime.strptime(str((row or {}).get("date") or "")[:10], "%Y-%m-%d").replace(tzinfo=KST).timestamp()
+        except Exception:
+            return 0.0
 
-    return rows
+    rows.sort(key=_sort_epoch, reverse=True)
+    return rows[:max(1, int(limit or 5))]
 
-NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v2-20260908"
+NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v3-20260908"
+NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
 
 
 def _classify_notice_kind(title):
@@ -8106,12 +8117,14 @@ def format_board_latest(command: str, rows):
 
 async def board_lookup(command: str):
     cache_key = f"board:{command}"
-    # Notice posts are time-sensitive; keep !공지 fresher than CM/update lookups.
-    cached = cache_get(cache_key, 60 if command == "공지" else 300)
-    if cached:
-        return cached
+    # !공지 must reflect the current notice list immediately; do not serve stale
+    # maintenance/live classification from cache. CM/update keep their short cache.
+    if command != "공지":
+        cached = cache_get(cache_key, 300)
+        if cached:
+            return cached
 
-    rows = await fetch_board_latest(command, limit=18 if command == "공지" else 5)
+    rows = await fetch_board_latest(command, limit=50 if command == "공지" else 5)
     result = format_board_latest(command, rows)
     cache_set(cache_key, result)
     return result
@@ -8920,6 +8933,7 @@ def _default_openchat_delivery_state():
         "lastAlias": "",
         "lastAckAt": "",
         "noticeClassifierVersion": "",
+        "noticeRecoveryVersion": "",
         "maintenanceSourceId": "",
         "maintenanceAnchor": "",
         "maintenancePending": None,
@@ -8964,7 +8978,7 @@ def _normalize_openchat_delivery(raw):
             if str(key) and expiry_f > now_epoch - 60:
                 clean_leases[str(key)] = expiry_f
         out["leases"] = clean_leases
-    for field in ("lastPollAt", "lastAlias", "lastAckAt", "noticeClassifierVersion", "maintenanceSourceId", "maintenanceAnchor"):
+    for field in ("lastPollAt", "lastAlias", "lastAckAt", "noticeClassifierVersion", "noticeRecoveryVersion", "maintenanceSourceId", "maintenanceAnchor"):
         if field in raw:
             out[field] = str(raw.get(field) or "")
     if isinstance(raw.get("maintenancePending"), dict):
@@ -9775,10 +9789,12 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     pending.append({"created": now_epoch, "item": item})
                     known_pending.add(key)
 
-        # One-time classifier upgrade recovery. If an actual maintenance/live notice
-        # was missed by the old title matcher, recover the newest recent one once.
-        # ACK is still required before it is permanently marked sent.
-        if str(delivery.get("noticeClassifierVersion") or "") != NOTICE_ALERT_CLASSIFIER_VERSION:
+        # Classifier-upgrade recovery.
+        # Important: do NOT consume the recovery merely because one poll ran.
+        # It is considered complete only after the phone actually sends it and ACKs.
+        # This also uses its own key so a legacy pre-ACK boardSent/sentKeys entry
+        # cannot suppress the one recovery alert the user explicitly missed.
+        if str(delivery.get("noticeRecoveryVersion") or "") != NOTICE_RECOVERY_VERSION:
             sent_keys_for_recovery = set(str(x) for x in (delivery.get("sentKeys") or []) if str(x))
             known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
             notice_rows = latest_by_board.get("공지") or []
@@ -9786,9 +9802,9 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 kind = _classify_notice_kind(post.get("title") or "")
                 if not kind or not _board_post_is_recent(post, now=now, max_hours=36):
                     continue
-                key = f"공지:{post['id']}"
-                if key in sent_keys_for_recovery or key in known_pending:
-                    continue
+                recovery_key = f"NOTICE_RECOVERY|{NOTICE_RECOVERY_VERSION}|{post['id']}"
+                if recovery_key in sent_keys_for_recovery or recovery_key in known_pending:
+                    break
                 card_url = board_card_url("공지", post["id"])
                 item = {
                     "type": "board_card",
@@ -9799,10 +9815,14 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     "message": card_url,
                     "cardUrl": card_url,
                     "officialUrl": str(post.get("link") or ""),
-                    "key": key,
+                    "key": recovery_key,
                 }
                 pending.append({"created": now_epoch, "item": item})
                 break
+
+        # Record the classifier version only when the notice source was actually fetched.
+        # This is diagnostic only; recovery completion itself is ACK-gated above.
+        if latest_by_board.get("공지"):
             delivery["noticeClassifierVersion"] = NOTICE_ALERT_CLASSIFIER_VERSION
 
         delivery["boardPending"] = pending[-100:]
@@ -9856,6 +9876,14 @@ async def openchat_alert_ack(room: str = "", key: str = "", room_alias: str = ""
         sent_keys = list(dict.fromkeys(
             [str(x) for x in (delivery.get("sentKeys") or []) if str(x)] + [alert_key]
         ))[-1000:]
+        # A recovery notice is complete only here, after the phone has sent it.
+        recovery_prefix = f"NOTICE_RECOVERY|{NOTICE_RECOVERY_VERSION}|"
+        if alert_key.startswith(recovery_prefix):
+            recovered_id = alert_key[len(recovery_prefix):].strip()
+            if recovered_id:
+                canonical_key = f"공지:{recovered_id}"
+                sent_keys = list(dict.fromkeys(sent_keys + [canonical_key]))[-1000:]
+            delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
         delivery["sentKeys"] = sent_keys
         delivery["lastAckAt"] = datetime.now(KST).isoformat()
         pending_maintenance = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
