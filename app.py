@@ -6949,49 +6949,140 @@ async def fetch_notice_detail_text(row):
 
 
 def _parse_maintenance_end_from_text(source, posted_date=""):
-    source = str(source or "")
-    posted = str(posted_date or "")
+    """Parse the effective maintenance completion time from a notice.
 
-    # Flexible: 9/4 04:30 ~ 06:00, 9.4 04:30 ~ 06:00,
-    # "점검 일시 : 9/4(금) 04:30 ~ 06:00" etc.
-    m = re.search(
+    Priority is actual completion > extension end > scheduled range.  Edited
+    notices may retain old times inside <s>/<del>/<strike>; those superseded
+    fragments are removed before parsing.
+    """
+    raw = unescape(str(source or ""))
+    posted = str(posted_date or "").strip()
+
+    # Remove superseded text from edited notices before flattening HTML.
+    text = re.sub(
+        r"<(?:s|del|strike)\b[^>]*>.*?</(?:s|del|strike)>",
+        " ", raw, flags=re.I | re.S,
+    )
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[\u00a0\u200b]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    posted_dt = None
+    try:
+        if re.match(r"^\d{4}-\d{2}-\d{2}", posted):
+            posted_dt = datetime.fromisoformat(posted[:10]).replace(tzinfo=KST)
+    except Exception:
+        posted_dt = None
+    base_year = posted_dt.year if posted_dt is not None else datetime.now(KST).year
+
+    def _resolve_year(month):
+        year = base_year
+        if posted_dt is not None:
+            # Handle notices posted around New Year for a Jan/Dec maintenance.
+            if posted_dt.month == 12 and int(month) == 1:
+                year += 1
+            elif posted_dt.month == 1 and int(month) == 12:
+                year -= 1
+        return year
+
+    # Scheduled maintenance range. This also gives the date and start clock.
+    range_match = re.search(
         r"(?P<month>\d{1,2})\s*[/.]\s*(?P<day>\d{1,2})"
         r"(?:\s*\([^)]*\))?"
-        r".{0,160}?"
-        r"(?P<sh>\d{1,2})\s*:\s*(?P<sm>\d{2})"
+        r".{0,220}?"
+        r"(?P<sh>\d{1,2})\s*[:：]\s*(?P<sm>\d{2})"
         r"\s*(?:~|∼|～|–|—|-)\s*"
-        r"(?P<eh>\d{1,2})\s*:\s*(?P<em>\d{2})",
-        source,
-        re.S,
+        r"(?P<eh>\d{1,2})\s*[:：]\s*(?P<em>\d{2})",
+        text, re.I | re.S,
     )
-    if not m:
+
+    month = day = sh = sm = None
+    scheduled_end = None
+    if range_match:
+        try:
+            month = int(range_match.group("month"))
+            day = int(range_match.group("day"))
+            sh = int(range_match.group("sh"))
+            sm = int(range_match.group("sm"))
+            eh = int(range_match.group("eh"))
+            em = int(range_match.group("em"))
+            year = _resolve_year(month)
+            start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
+            scheduled_end = datetime(year, month, day, eh, em, tzinfo=KST)
+            if scheduled_end <= start_dt:
+                scheduled_end += timedelta(days=1)
+        except Exception:
+            scheduled_end = None
+
+    # If the full range was not found, recover the notice's month/day.
+    if month is None or day is None:
+        dm = re.search(r"(?<!\d)(\d{1,2})\s*[/.]\s*(\d{1,2})(?!\d)", text)
+        if dm:
+            try:
+                month, day = int(dm.group(1)), int(dm.group(2))
+            except Exception:
+                month = day = None
+
+    # Use post date only as a last-resort date anchor.
+    if (month is None or day is None) and posted_dt is not None:
+        month, day = posted_dt.month, posted_dt.day
+
+    clock_pattern = (
+        r"(?P<h>[01]?\d|2[0-3])"
+        r"(?:\s*[:：]\s*(?P<mc>[0-5]\d)|\s*시(?:\s*(?P<mk>[0-5]?\d)\s*분)?)"
+    )
+
+    def _clock_from_match(match):
+        if not match:
+            return None
+        try:
+            hour = int(match.group("h"))
+            minute = int(match.group("mc") or match.group("mk") or 0)
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+        except Exception:
+            pass
         return None
 
-    year = datetime.now(KST).year
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", posted):
+    # Actual completion/ending is authoritative, including "점검 종료 7시 30분".
+    completion_patterns = [
+        r"(?:정기\s*)?점검(?:이|이\s*)?\s*(?:완료|종료)(?:\s*(?:시간|시각))?\s*[:：-]?\s*.{0,45}?" + clock_pattern,
+        r"(?:정기\s*)?점검.{0,80}?" + clock_pattern + r"\s*(?:에|부터)?\s*(?:완료|종료)(?:되었습니다|됐습니다|됨|되었)?",
+        clock_pattern + r"\s*현재.{0,140}?(?:정상적으로\s*게임\s*이용|점검(?:이)?\s*(?:완료|종료))",
+    ]
+    completion_clock = None
+    for pattern in completion_patterns:
+        completion_clock = _clock_from_match(re.search(pattern, text, re.I | re.S))
+        if completion_clock is not None:
+            break
+
+    # Extension text commonly says "연장되어 10:30 종료 예정".
+    extension_patterns = [
+        r"연장.{0,180}?" + clock_pattern + r"\s*(?:에|까지)?\s*(?:종료|완료)(?:\s*예정)?",
+        r"연장.{0,180}?(?:종료|완료)(?:\s*예정)?\s*[:：-]?\s*" + clock_pattern,
+    ]
+    extension_clock = None
+    for pattern in extension_patterns:
+        extension_clock = _clock_from_match(re.search(pattern, text, re.I | re.S))
+        if extension_clock is not None:
+            break
+
+    effective_clock = completion_clock or extension_clock
+    if effective_clock is not None and month is not None and day is not None:
         try:
-            year = int(posted[:4])
+            eh, em = effective_clock
+            year = _resolve_year(month)
+            end_dt = datetime(year, month, day, eh, em, tzinfo=KST)
+            if sh is not None and sm is not None:
+                start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
+                if end_dt <= start_dt:
+                    end_dt += timedelta(days=1)
+            return end_dt
         except Exception:
             pass
 
-    try:
-        month = int(m.group("month"))
-        day = int(m.group("day"))
-        sh = int(m.group("sh"))
-        sm = int(m.group("sm"))
-        eh = int(m.group("eh"))
-        em = int(m.group("em"))
-
-        start = datetime(year, month, day, sh, sm, tzinfo=KST)
-        end = datetime(year, month, day, eh, em, tzinfo=KST)
-
-        if end <= start:
-            end += timedelta(days=1)
-
-        return end
-    except Exception:
-        return None
-
+    return scheduled_end
 
 def _parse_maintenance_end_from_notice(row):
     title = str((row or {}).get("title") or "")
@@ -7044,7 +7135,7 @@ def _schedule_key(name):
         "시공": "sigong", "시공쟁탈전": "sigong",
         "균영": "gyunyeol", "균열": "gyunyeol", "균열지대": "gyunyeol",
         "아티": "ati", "아티쟁": "ati",
-        "필드보스": "fieldboss",
+        "필드보스": "fieldboss", "필보": "fieldboss",
     }
     return aliases.get(key)
 
@@ -7290,12 +7381,16 @@ def _persist_official_agro_anchor(anchor, source_id="", source_title=""):
     data = _load_boss_schedule_overrides()
     current = data.get("agroOfficial") if isinstance(data.get("agroOfficial"), dict) else {}
     old_anchor = _parse_kst_iso(current.get("anchor"))
-    # Never let an older maintenance notice roll the official anchor backward.
-    if old_anchor is not None and old_anchor > anchor:
+    old_source = str(current.get("sourceId") or "")
+    new_source = str(source_id or "")
+    # A different/older notice may never roll the anchor backward.  The same
+    # notice ID, however, can be edited when maintenance is extended or ends
+    # early, so its corrected effective end is allowed in either direction.
+    if old_anchor is not None and old_anchor > anchor and not (old_source and new_source and old_source == new_source):
         return True
     data["agroOfficial"] = {
         "anchor": anchor.astimezone(KST).isoformat(),
-        "sourceId": str(source_id or ""),
+        "sourceId": new_source,
         "sourceTitle": str(source_title or ""),
         "updatedAt": datetime.now(KST).isoformat(),
     }
@@ -7308,6 +7403,7 @@ def _persisted_official_agro_info():
         "anchor": _parse_kst_iso(row.get("anchor")),
         "sourceId": str(row.get("sourceId") or ""),
         "sourceTitle": str(row.get("sourceTitle") or ""),
+        "updatedAt": str(row.get("updatedAt") or ""),
     }
 
 def _persisted_official_agro_anchor():
@@ -7360,8 +7456,12 @@ def _bind_or_rebase_maintenance_schedules(old_anchor, new_anchor, source_id, sou
         }
         return _save_boss_schedule_overrides(data)
 
-    # Same notice = no schedule mutation. Older/equal anchors are also ignored.
-    if (new_source and bound_source == new_source) or new_anchor <= bound_anchor:
+    same_source = bool(new_source and bound_source and new_source == bound_source)
+    # Same article can be edited for extension/early completion. Accept a changed
+    # anchor for that same source. For a different source, never move backward.
+    if new_anchor == bound_anchor:
+        return True
+    if not same_source and new_anchor < bound_anchor:
         return True
 
     delta = _maintenance_clock_delta_minutes(bound_anchor, new_anchor)
@@ -7410,7 +7510,7 @@ def _bind_or_rebase_maintenance_schedules(old_anchor, new_anchor, source_id, sou
     return ok
 
 def _manual_agro_anchor_for_source(source_id=None, official_anchor=None):
-    """Keep manual Agro time until a genuinely newer maintenance is confirmed."""
+    """Keep manual Agro time until an official maintenance confirmation is newer."""
     data = _load_boss_schedule_overrides()
     row = data.get("agro") or {}
     manual = _parse_kst_iso(row.get("anchor"))
@@ -7418,13 +7518,20 @@ def _manual_agro_anchor_for_source(source_id=None, official_anchor=None):
         return None
     stored_source = str(row.get("sourceId") or "")
     current_source = str(source_id or "")
+    set_at = _parse_kst_iso(row.get("setAt"))
+
+    official_info = data.get("agroOfficial") if isinstance(data.get("agroOfficial"), dict) else {}
+    official_updated = _parse_kst_iso(official_info.get("updatedAt"))
+
+    # Any official confirmation saved after the manual correction wins. This
+    # correctly handles edits/extensions that keep the same article ID.
+    if set_at is not None and official_updated is not None and official_updated > set_at:
+        return None
+
     if not current_source:
         return manual
     if stored_source and stored_source == current_source:
         return manual
-    set_at = _parse_kst_iso(row.get("setAt"))
-    if official_anchor is not None and set_at is not None:
-        return None if official_anchor > set_at else manual
     if stored_source and stored_source != current_source:
         return None
     return manual
@@ -7468,7 +7575,7 @@ def _set_manual_schedule(name, hour, minute):
         data["gyunyeol"] = {"times": [[hour, minute]]}
     elif key in ("아티", "아티쟁"):
         data["ati"] = {"times": [[hour, minute]]}
-    elif key == "필드보스":
+    elif key in ("필보", "필드보스"):
         data["fieldboss"] = {"times": [[hour, minute]]}
     else:
         return False
@@ -7509,15 +7616,20 @@ async def latest_maintenance_anchor():
             if "점검" not in str(row.get("title") or ""):
                 continue
             source_id = str(row.get("id") or "")
-            if persisted_source and source_id and source_id == persisted_source:
-                continue
 
+            # NC may edit the same maintenance article when it is extended or
+            # completed. Always re-parse the current source; equality is ignored,
+            # but a changed effective end for that same source is authoritative.
             detail_text = await fetch_notice_detail_text(row)
             parsed = _parse_maintenance_end_from_text(detail_text, row.get("date") or "")
             if parsed is None:
                 continue
-            if persisted_anchor is not None and parsed <= persisted_anchor:
-                # This is a past/old maintenance notice. Never reuse it.
+            same_source = bool(persisted_source and source_id and source_id == persisted_source)
+            if same_source:
+                if persisted_anchor is not None and parsed == persisted_anchor:
+                    continue
+            elif persisted_anchor is not None and parsed <= persisted_anchor:
+                # Different older notice: never roll a confirmed source backward.
                 continue
 
             candidate = {
@@ -7834,6 +7946,8 @@ def _schedule_alert_targets(now):
 
 
 async def _manual_schedule_command(name, clock_text):
+    if name == "필보":
+        name = "필드보스"
     parsed = _parse_manual_clock(clock_text)
     if parsed is None:
         return "⚠️ 시간 형식은 21:00 또는 21시처럼 입력해주세요."
@@ -7929,19 +8043,65 @@ BOARD_CONFIGS = {
     },
 }
 
+def _parse_board_post_datetime(value):
+    """Best-effort PlayNC post timestamp parser used for pinned-post ordering."""
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+            if number > 10_000_000_000:
+                number /= 1000.0
+            return datetime.fromtimestamp(number, tz=KST)
+        except Exception:
+            return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,16}(?:\.\d+)?", text):
+        try:
+            number = float(text)
+            if number > 10_000_000_000:
+                number /= 1000.0
+            return datetime.fromtimestamp(number, tz=KST)
+        except Exception:
+            pass
+    iso = text.replace("Z", "+00:00") if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    except Exception:
+        pass
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=KST)
+        except Exception:
+            continue
+    return None
+
+
 async def fetch_board_latest(command: str, limit: int = 5):
     config = BOARD_CONFIGS[command]
     alias = config["alias"]
 
     url = f"{COMMUNITY_API}/{alias}/article/search/moreArticle"
 
+    # Notices can be preceded by fixed/pinned posts. Always request a wider
+    # notice window, then sort by publication time before applying `limit`.
+    requested_limit = max(1, int(limit or 5))
+    request_size = 50 if command == "공지" else max(18, min(50, requested_limit))
+
     client = await get_http_client()
     response = await client.get(
         url,
         params={
             "isVote": "true",
-            # Ask for enough rows that pinned/fixed notices cannot hide a new post.
-            "moreSize": str(max(18, min(50, int(limit or 18)))),
+            "moreSize": str(request_size),
             "moreDirection": "BEFORE",
             "previousArticleId": "0",
         },
@@ -7951,7 +8111,6 @@ async def fetch_board_latest(command: str, limit: int = 5):
     response.raise_for_status()
     data = response.json()
 
-    # PlayNC payload has normally been {"contentList":[...]}, but tolerate wrappers.
     content_list = []
     if isinstance(data, dict):
         if isinstance(data.get("contentList"), list):
@@ -7975,7 +8134,8 @@ async def fetch_board_latest(command: str, limit: int = 5):
         if not content_id or not title:
             continue
 
-        date_text = str(posted)[:10] if posted else ""
+        parsed_posted = _parse_board_post_datetime(posted)
+        date_text = parsed_posted.strftime("%Y-%m-%d") if parsed_posted is not None else (str(posted)[:10] if posted else "")
         link = (
             f"https://aion2.plaync.com/ko-kr/board/"
             f"{config['view']}/view?articleId={content_id}"
@@ -7985,15 +8145,13 @@ async def fetch_board_latest(command: str, limit: int = 5):
             "id": str(content_id),
             "title": title,
             "date": date_text,
-            "postedAt": str(posted or ""),
+            "postedAt": parsed_posted.isoformat() if parsed_posted is not None else str(posted or ""),
             "link": link,
             "rawText": json.dumps(item, ensure_ascii=False),
         })
 
-    # The board API may place pinned/fixed posts before newer normal posts.
-    # Always normalize to real publication time before lastSeen/new-post logic.
     def _sort_epoch(row):
-        dt = _parse_kst_iso((row or {}).get("postedAt"))
+        dt = _parse_board_post_datetime((row or {}).get("postedAt"))
         if dt is not None:
             return dt.timestamp()
         try:
@@ -8002,7 +8160,7 @@ async def fetch_board_latest(command: str, limit: int = 5):
             return 0.0
 
     rows.sort(key=_sort_epoch, reverse=True)
-    return rows[:max(1, int(limit or 5))]
+    return rows[:requested_limit]
 
 NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v3-20260908"
 NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
@@ -9162,12 +9320,12 @@ async def _official_page_og_image(url: str):
         return ""
 
 @app.get("/p/{board_name}/{post_id}")
-async def pretty_board_card(board_name: str, post_id: int):
+async def pretty_board_card(board_name: str, post_id: str):
     normalized = "CM" if board_name.lower() == "cm" else board_name
     if normalized not in BOARD_CONFIGS:
         return HTMLResponse("<h2>잘못된 게시판입니다.</h2>", status_code=404)
 
-    rows = await fetch_board_latest(normalized, limit=18)
+    rows = await fetch_board_latest(normalized, limit=50 if normalized == "공지" else 18)
     post = next((x for x in rows if str(x["id"]) == str(post_id)), None)
 
     # Old post may not be in latest 18; still make a valid redirect card.
@@ -9513,13 +9671,21 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             if not seen_source and current_source and current_anchor is not None:
                 delivery["maintenanceSourceId"] = current_source
                 delivery["maintenanceAnchor"] = current_anchor.astimezone(KST).isoformat()
-            elif current_source and current_anchor is not None and current_source != seen_source:
-                if not pending or str(pending.get("sourceId") or "") != current_source:
+            elif current_source and current_anchor is not None and (
+                current_source != seen_source or seen_anchor is None or current_anchor != seen_anchor
+            ):
+                pending_anchor = current_anchor.astimezone(KST).strftime("%Y%m%d%H%M")
+                pending_key = (
+                    "MAINT|"
+                    + re.sub(r"[^0-9A-Za-z_-]", "", current_source)[:100]
+                    + "|" + pending_anchor
+                )
+                if not pending or str(pending.get("key") or "") != pending_key:
                     delta = _maintenance_clock_delta_minutes(seen_anchor, current_anchor) if seen_anchor else 0
                     if delta:
                         nxt = next_agro_from_anchor(current_anchor, now)
                         pending = {
-                            "key": "MAINT|" + re.sub(r"[^0-9A-Za-z_-]", "", current_source)[:100],
+                            "key": pending_key,
                             "sourceId": current_source,
                             "anchor": current_anchor.astimezone(KST).isoformat(),
                             "oldTime": seen_anchor.strftime("%H:%M") if seen_anchor else "기존",
@@ -9717,7 +9883,8 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
     # ---------------- BOARD PATH ----------------
     async def _fetch_board(board_name):
         try:
-            return await asyncio.wait_for(fetch_board_latest(board_name, limit=18), timeout=4.0)
+            board_limit = 50 if board_name == "공지" else 18
+            return await asyncio.wait_for(fetch_board_latest(board_name, limit=board_limit), timeout=4.0)
         except Exception:
             return []
 
@@ -9734,16 +9901,16 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
         first_run = not delivery.get("initialized")
         pending = []
 
-        # Keep previously discovered board items retryable for 30 minutes.
+        # Keep discovered board items retryable until the phone ACKs them.
+        # The list is bounded to 100 below, so a transient send/ACK failure cannot
+        # silently discard a notice after an arbitrary 30-minute timeout.
         for row in (delivery.get("boardPending") or []):
             if not isinstance(row, dict):
                 continue
-            try:
-                created = float(row.get("created") or 0)
-            except Exception:
-                created = 0.0
-            if now_epoch - created <= 1800 and isinstance(row.get("item"), dict):
-                pending.append(row)
+            item = row.get("item")
+            if not isinstance(item, dict) or not str(item.get("key") or "").strip():
+                continue
+            pending.append(row)
 
         if first_run:
             for board, rows in latest_by_board.items():
@@ -9844,7 +10011,7 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 continue
             if float(leases.get(key) or 0) > now_epoch:
                 continue
-            # Board alerts remain pending for up to 30 minutes, but the lease is
+            # Board alerts remain pending until the phone ACKs them. The lease is
             # intentionally short. If the phone fetches but cannot send/ACK, the
             # next MessengerBotR poll retries instead of losing the alert.
             leases[key] = now_epoch + 8.0
@@ -11708,7 +11875,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
     # Boss/content alert lead correction:
     # !아그로 25분전 / !시공 25분전 10분전 / !아그로 알림 25 10
     m_alert_lead = re.fullmatch(
-        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|필드보스)\s+(?:(?:알림)\s+)?((?:\d{1,3}\s*(?:분전|분\s*전)?)(?:\s+\d{1,3}\s*(?:분전|분\s*전)?)*?)",
+        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|필보|필드보스)\s+(?:(?:알림)\s+)?((?:\d{1,3}\s*(?:분전|분\s*전)?)(?:\s+\d{1,3}\s*(?:분전|분\s*전)?)*?)",
         body,
     )
     if m_alert_lead and ("분" in body or "알림" in body):
@@ -11717,7 +11884,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
 
     # Boss/content schedule correction: !카이라 02:00 / !시공 21:00 / !아그로 06:00
     m_schedule = re.fullmatch(
-        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|필드보스)\s+(.+)",
+        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|필보|필드보스)\s+(.+)",
         body,
     )
     if m_schedule:
