@@ -7890,6 +7890,166 @@ def _set_manual_schedule(name, hour, minute):
     _apply_manual_schedule_overrides()
     return True
 
+
+# Secondary maintenance-title fallback.
+# The official AION2 notice page is sometimes only an iframe/JS shell from
+# Render's point of view. In that situation the public Inven "소식" mirror can
+# expose the revised maintenance TITLE (for example 09:30 -> 10:00 or (연장))
+# before the official article body is readable by this server. This source is
+# used only to correct the CURRENT persisted maintenance day; it never replaces
+# a clearly parsed official extension/completion result.
+INVEN_AION2_NEWS_URL = "https://m.inven.co.kr/board/aion2/6388?category=%EC%86%8C%EC%8B%9D"
+
+
+def _parse_maintenance_title_range(title, now=None):
+    """Parse one AION2 maintenance list title into a dated start/end range."""
+    now = now or datetime.now(KST)
+    title_text = re.sub(r"\s+", " ", unescape(str(title or ""))).strip()
+    if not title_text or "점검" not in title_text:
+        return None
+
+    m = re.search(
+        r"(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})"
+        r"(?:\s*\([^)]*\))?\s*"
+        r"(?P<sh>[01]?\d|2[0-3])\s*[:：]\s*(?P<sm>[0-5]\d)"
+        r"\s*(?:~|∼|～|–|—|-)\s*"
+        r"(?P<eh>[01]?\d|2[0-3])\s*[:：]\s*(?P<em>[0-5]\d)"
+        r".{0,80}?(?:정기|임시|결제\s*시스템)?\s*점검",
+        title_text,
+        re.I,
+    )
+    if not m:
+        return None
+
+    try:
+        month = int(m.group("month"))
+        day = int(m.group("day"))
+        sh = int(m.group("sh"))
+        sm = int(m.group("sm"))
+        eh = int(m.group("eh"))
+        em = int(m.group("em"))
+        year = now.year
+        if now.month == 12 and month == 1:
+            year += 1
+        elif now.month == 1 and month == 12:
+            year -= 1
+        start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
+        end_dt = datetime(year, month, day, eh, em, tzinfo=KST)
+        if end_dt <= start_dt:
+            end_dt += timedelta(days=1)
+    except Exception:
+        return None
+
+    # Only inspect a narrow prefix around the matched range for status words.
+    prefix = title_text[max(0, m.start() - 28):m.start()]
+    suffix = title_text[m.end():m.end() + 28]
+    status_text = (prefix + " " + suffix).strip()
+
+    kind = "schedule"
+    if "연장" in status_text and not re.search(r"연장\s*(?:될\s*)?수\s*있|연장\s*가능|연장\s*가능성", status_text, re.I):
+        kind = "extension"
+    elif "조기" in status_text and ("종료" in status_text or "완료" in status_text):
+        kind = "early_end"
+    elif "완료" in status_text or "종료" in status_text:
+        kind = "completion"
+
+    matched_title = title_text[max(0, m.start() - 18): min(len(title_text), m.end() + 32)].strip()
+    return {
+        "start": start_dt,
+        "end": end_dt,
+        "title": matched_title,
+        "kind": kind,
+    }
+
+
+async def _fetch_inven_current_maintenance_candidate(persisted_anchor=None, persisted_source="", now=None):
+    """Return a mirror correction only for the currently persisted maintenance day.
+
+    This is deliberately narrow. It does not discover arbitrary future schedules;
+    it only helps when the official page shell/detail is stale or unreadable and a
+    public AION2-news mirror already shows a revised title for the same maintenance.
+    """
+    now = now or datetime.now(KST)
+    if persisted_anchor is None:
+        return None
+
+    client = await get_http_client()
+    try:
+        response = await client.get(
+            INVEN_AION2_NEWS_URL,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "ko-KR,ko;q=0.9",
+                "User-Agent": HEADERS["User-Agent"],
+            },
+            timeout=httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=2.0),
+        )
+        if response.status_code != 200 or not response.text:
+            return None
+        raw = unescape(str(response.text))
+    except Exception:
+        return None
+
+    plain = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+    plain = re.sub(r"<style\b[^>]*>.*?</style>", " ", plain, flags=re.I | re.S)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = re.sub(r"[\u00a0\u200b]", " ", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+
+    seen = set()
+    parsed_rows = []
+    for dm in re.finditer(r"(?<!\d)\d{1,2}\s*/\s*\d{1,2}(?!\d)", plain):
+        left = max(0, dm.start() - 45)
+        right = min(len(plain), dm.start() + 220)
+        parsed = _parse_maintenance_title_range(plain[left:right], now=now)
+        if not parsed:
+            continue
+        key = (parsed["start"].isoformat(), parsed["end"].isoformat(), parsed["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed_rows.append(parsed)
+
+    if not parsed_rows:
+        return None
+
+    same = []
+    for row in parsed_rows:
+        start_dt = row.get("start")
+        end_dt = row.get("end")
+        if start_dt is None or end_dt is None:
+            continue
+        if start_dt.date() != persisted_anchor.date():
+            continue
+        if abs((end_dt.date() - persisted_anchor.date()).days) > 1:
+            continue
+        # AION2 game maintenance should be an actual game maintenance title.
+        # Payment-system-only maintenance must never move Agro.
+        if "결제" in str(row.get("title") or ""):
+            continue
+        same.append(row)
+
+    if not same:
+        return None
+
+    # Prefer explicit extension/completion titles. Otherwise prefer the last
+    # occurrence in the current list text, which is normally the revised title.
+    definitive = [r for r in same if r.get("kind") in ("extension", "early_end", "completion")]
+    best = definitive[0] if definitive else same[0]
+    return {
+        "end": best["end"],
+        "start": best["start"],
+        "scheduledEnd": best["end"],
+        "title": best["title"],
+        "id": str(persisted_source or "mirror-maintenance"),
+        "postedAt": now,
+        "postedAtText": now.isoformat(),
+        "kind": best["kind"] if best["kind"] != "schedule" else "schedule_change",
+        "titleKind": best["kind"],
+        "mirrorFallback": True,
+    }
+
+
 async def latest_maintenance_anchor():
     """Maintenance anchor + live maintenance tracking policy.
 
@@ -8039,6 +8199,31 @@ async def latest_maintenance_anchor():
 
     except Exception:
         chosen = None
+
+    # If the official page/API is still exposing the persisted old clock, use a
+    # narrowly scoped public AION2-news mirror title as a correction for the same
+    # maintenance day. A definitive official extension/completion always wins.
+    try:
+        official_definitive = bool(
+            chosen is not None
+            and str(chosen.get("kind") or "") in ("extension", "early_end", "completion")
+        )
+        official_moved = bool(
+            chosen is not None
+            and persisted_anchor is not None
+            and chosen.get("end") is not None
+            and chosen.get("end") != persisted_anchor
+        )
+        if persisted_anchor is not None and not official_definitive and not official_moved:
+            mirror = await _fetch_inven_current_maintenance_candidate(
+                persisted_anchor=persisted_anchor,
+                persisted_source=persisted_source,
+                now=now,
+            )
+            if mirror is not None and mirror.get("end") is not None and mirror.get("end") != persisted_anchor:
+                chosen = mirror
+    except Exception:
+        pass
 
     if chosen is not None:
         official_anchor = chosen["end"]
