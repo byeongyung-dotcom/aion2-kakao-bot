@@ -13,7 +13,7 @@ from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin, urlparse
 from html import escape, unescape
 from html.parser import HTMLParser
 
@@ -6956,6 +6956,7 @@ async def fetch_notice_detail_text(row):
             continue
 
     page_piece = ""
+    iframe_pieces = []
     page_url = str(row.get("link") or "").strip()
     if page_url:
         try:
@@ -6969,21 +6970,73 @@ async def fetch_notice_detail_text(row):
             )
             if response.status_code == 200 and response.text:
                 candidate = str(response.text)
+
+                # The AION2 notice route may be only an outer page shell. The
+                # actual article body is rendered inside an iframe, while the
+                # shell can still carry stale hydration/list metadata. Follow
+                # official PlayNC iframe sources and treat them as the newest
+                # article representation.
+                iframe_sources = []
+                for m in re.finditer(
+                    r"<iframe\b[^>]*?\bsrc\s*=\s*([\"'])(.*?)\1",
+                    candidate,
+                    re.I | re.S,
+                ):
+                    raw_src = unescape(str(m.group(2) or "").strip())
+                    if not raw_src:
+                        continue
+                    resolved = urljoin(page_url, raw_src)
+                    try:
+                        host = (urlparse(resolved).hostname or "").lower()
+                    except Exception:
+                        host = ""
+                    if not (
+                        host == "plaync.com"
+                        or host.endswith(".plaync.com")
+                        or host == "playnccdn.com"
+                        or host.endswith(".playnccdn.com")
+                    ):
+                        continue
+                    if resolved not in iframe_sources:
+                        iframe_sources.append(resolved)
+                    if len(iframe_sources) >= 6:
+                        break
+
+                for iframe_url in iframe_sources:
+                    try:
+                        iframe_response = await client.get(
+                            iframe_url,
+                            headers={
+                                **PLAYNC_HEADERS,
+                                "accept": "text/html,application/xhtml+xml,application/json",
+                            },
+                            timeout=httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=2.0),
+                        )
+                        if iframe_response.status_code != 200 or not iframe_response.text:
+                            continue
+                        iframe_candidate = str(iframe_response.text)
+                        if _maintenance_detail_has_signal(iframe_candidate):
+                            iframe_pieces.append(iframe_candidate)
+                    except Exception:
+                        continue
+
                 if _maintenance_detail_has_signal(candidate):
                     page_piece = candidate
         except Exception:
             pass
 
-    # The actual public article page is the highest-priority representation.
-    # Do NOT append list_fallback when detail exists; that was the stale-time bug.
+    # Never mix list/search metadata into a successfully fetched detail source.
+    # Put iframe content last: downstream maintenance parsers deliberately choose
+    # the last live range/completion marker, so an edited 10:00 body supersedes
+    # a stale 09:30 shell/API representation.
+    detail_pieces = []
     if page_piece:
-        return (title + "\n" + page_piece).strip()
+        detail_pieces.append(page_piece)
+    detail_pieces.extend(api_pieces)
+    detail_pieces.extend(iframe_pieces)
 
-    if api_pieces:
-        # Keep all successful official detail payloads in request order. Parsers
-        # below intentionally use the LAST valid revision/range, so a later detail
-        # representation can supersede an earlier cached representation.
-        return (title + "\n" + "\n".join(api_pieces)).strip()
+    if detail_pieces:
+        return (title + "\n" + "\n".join(detail_pieces)).strip()
 
     return list_fallback
 
