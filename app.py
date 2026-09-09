@@ -7685,9 +7685,12 @@ def _persist_official_agro_anchor(anchor, source_id="", source_title="", source_
     old_anchor = _parse_kst_iso(current.get("anchor"))
     old_source = str(current.get("sourceId") or "")
     new_source = str(source_id or "")
-    # Different old notices may never roll the anchor backward. A clearly
-    # identified official completion/early-end notice is the one exception.
-    if old_anchor is not None and old_anchor > anchor and not force_backward and not (old_source and new_source and old_source == new_source):
+    # Never let an ordinary/stale source roll the official anchor backward.
+    # A backward move is accepted only for a clearly identified completion /
+    # early-end result (force_backward=True). This also protects against the
+    # SAME article being served from an older cache after we already learned a
+    # newer end time from another source.
+    if old_anchor is not None and old_anchor > anchor and not force_backward:
         return True
     data["agroOfficial"] = {
         "anchor": anchor.astimezone(KST).isoformat(),
@@ -7963,15 +7966,17 @@ def _parse_maintenance_title_range(title, now=None):
 
 
 async def _fetch_inven_current_maintenance_candidate(persisted_anchor=None, persisted_source="", now=None):
-    """Return a mirror correction only for the currently persisted maintenance day.
+    """Return the best recent AION2 maintenance title from the public news mirror.
 
-    This is deliberately narrow. It does not discover arbitrary future schedules;
-    it only helps when the official page shell/detail is stale or unreadable and a
-    public AION2-news mirror already shows a revised title for the same maintenance.
+    Important: discovery must NOT depend on an already-correct persisted anchor.
+    After a Render redeploy the state can be empty, and after a week the persisted
+    anchor can still be the previous maintenance day. In both cases we still need
+    to discover today's/current maintenance.
+
+    The mirror is only a fallback for a non-definitive official result. Official
+    extension/completion text always outranks this source.
     """
     now = now or datetime.now(KST)
-    if persisted_anchor is None:
-        return None
 
     client = await get_http_client()
     try:
@@ -8004,7 +8009,9 @@ async def _fetch_inven_current_maintenance_candidate(persisted_anchor=None, pers
         parsed = _parse_maintenance_title_range(plain[left:right], now=now)
         if not parsed:
             continue
-        key = (parsed["start"].isoformat(), parsed["end"].isoformat(), parsed["title"])
+        if "결제" in str(parsed.get("title") or ""):
+            continue
+        key = (parsed["start"].isoformat(), parsed["end"].isoformat(), parsed["title"], parsed.get("kind"))
         if key in seen:
             continue
         seen.add(key)
@@ -8013,37 +8020,56 @@ async def _fetch_inven_current_maintenance_candidate(persisted_anchor=None, pers
     if not parsed_rows:
         return None
 
-    same = []
-    for row in parsed_rows:
-        start_dt = row.get("start")
-        end_dt = row.get("end")
-        if start_dt is None or end_dt is None:
-            continue
-        if start_dt.date() != persisted_anchor.date():
-            continue
-        if abs((end_dt.date() - persisted_anchor.date()).days) > 1:
-            continue
-        # AION2 game maintenance should be an actual game maintenance title.
-        # Payment-system-only maintenance must never move Agro.
-        if "결제" in str(row.get("title") or ""):
-            continue
-        same.append(row)
+    # 1) If the persisted anchor is still recent (same maintenance cycle), prefer
+    # that calendar day.  2) Otherwise discover the most recent/current
+    # maintenance independently of persisted state. This fixes both empty state
+    # after deploy and a previous-week anchor such as 9/2 while today is 9/9.
+    pool = []
+    if persisted_anchor is not None:
+        age_hours = abs((now - persisted_anchor).total_seconds()) / 3600.0
+        if age_hours <= 36:
+            pool = [
+                r for r in parsed_rows
+                if r.get("start") is not None
+                and r["start"].date() == persisted_anchor.date()
+            ]
 
-    if not same:
+    if not pool:
+        recent_cutoff = now - timedelta(hours=48)
+        future_cutoff = now + timedelta(hours=12)
+        pool = [
+            r for r in parsed_rows
+            if r.get("start") is not None
+            and recent_cutoff <= r["start"] <= future_cutoff
+        ]
+
+    if not pool:
         return None
 
-    # Prefer explicit extension/completion titles. Otherwise prefer the last
-    # occurrence in the current list text, which is normally the revised title.
-    definitive = [r for r in same if r.get("kind") in ("extension", "early_end", "completion")]
-    best = definitive[0] if definitive else same[0]
+    # Explicit extension/completion titles are stronger than a plain schedule
+    # title. For plain schedule duplicates (e.g. stale 09:30 and revised 10:00),
+    # choose the later end on the most recent maintenance day.
+    newest_day = max(r["start"].date() for r in pool if r.get("start") is not None)
+    pool = [r for r in pool if r.get("start") is not None and r["start"].date() == newest_day]
+
+    definitive = [r for r in pool if r.get("kind") in ("extension", "early_end", "completion")]
+    if definitive:
+        best = definitive[0]
+    else:
+        best = max(pool, key=lambda r: (r.get("end") or datetime.min.replace(tzinfo=KST)))
+
+    source_id = str(persisted_source or "")
     return {
         "end": best["end"],
         "start": best["start"],
         "scheduledEnd": best["end"],
         "title": best["title"],
-        "id": str(persisted_source or "mirror-maintenance"),
-        "postedAt": now,
-        "postedAtText": now.isoformat(),
+        # Preserve the current official article id when known, but do NOT stamp a
+        # fake current postedAt. Leaving postedAt empty means a later official NC
+        # result can always regain priority.
+        "id": source_id or ("mirror-maintenance-" + best["start"].strftime("%Y%m%d")),
+        "postedAt": None,
+        "postedAtText": "",
         "kind": best["kind"] if best["kind"] != "schedule" else "schedule_change",
         "titleKind": best["kind"],
         "mirrorFallback": True,
@@ -8070,7 +8096,11 @@ async def latest_maintenance_anchor():
 
     cached = _maintenance_anchor_cache.get("value")
     cached_ts = float(_maintenance_anchor_cache.get("ts") or 0)
-    if cached is not None and now_ts - cached_ts < cache_ttl:
+    cached_is_old_cycle = bool(
+        cached is not None
+        and (now - cached).total_seconds() > 5 * 24 * 60 * 60
+    )
+    if cached is not None and now_ts - cached_ts < cache_ttl and not cached_is_old_cycle:
         manual = _manual_agro_anchor_for_source(_maintenance_anchor_cache.get("sourceId"), cached)
         return manual if manual is not None else cached
 
@@ -8181,6 +8211,11 @@ async def latest_maintenance_anchor():
                     continue
                 if persisted_anchor is not None and not same_day:
                     continue
+                # A plain schedule edit may move later, but an older cached copy
+                # of the SAME article must never move the anchor backward. A real
+                # earlier finish is handled above as completion/early_end.
+                if persisted_anchor is not None and end_dt < persisted_anchor:
+                    continue
                 chosen = dict(c)
                 chosen["kind"] = "schedule_change"
                 break
@@ -8200,28 +8235,33 @@ async def latest_maintenance_anchor():
     except Exception:
         chosen = None
 
-    # If the official page/API is still exposing the persisted old clock, use a
-    # narrowly scoped public AION2-news mirror title as a correction for the same
-    # maintenance day. A definitive official extension/completion always wins.
+    # Cross-check every NON-definitive official result against the public news
+    # mirror. This must also run when persisted state is empty or belongs to the
+    # previous maintenance cycle. A stale official shell such as 09:30 must not
+    # block a revised 10:00 title simply because it differs from last week's anchor.
     try:
         official_definitive = bool(
             chosen is not None
             and str(chosen.get("kind") or "") in ("extension", "early_end", "completion")
         )
-        official_moved = bool(
-            chosen is not None
-            and persisted_anchor is not None
-            and chosen.get("end") is not None
-            and chosen.get("end") != persisted_anchor
-        )
-        if persisted_anchor is not None and not official_definitive and not official_moved:
+        if not official_definitive:
             mirror = await _fetch_inven_current_maintenance_candidate(
                 persisted_anchor=persisted_anchor,
                 persisted_source=persisted_source,
                 now=now,
             )
-            if mirror is not None and mirror.get("end") is not None and mirror.get("end") != persisted_anchor:
-                chosen = mirror
+            if mirror is not None and mirror.get("end") is not None:
+                mirror_end = mirror.get("end")
+                chosen_end = chosen.get("end") if isinstance(chosen, dict) else None
+
+                if chosen is None:
+                    chosen = mirror
+                elif chosen_end is not None and mirror.get("start") is not None and chosen.get("start") is not None:
+                    same_maintenance_day = mirror["start"].date() == chosen["start"].date()
+                    if same_maintenance_day and mirror_end > chosen_end:
+                        chosen = mirror
+                elif persisted_anchor is None or mirror_end > persisted_anchor:
+                    chosen = mirror
     except Exception:
         pass
 
