@@ -6857,52 +6857,84 @@ def _flatten_text_values(node, out=None, depth=0):
     return out
 
 
-async def fetch_notice_detail_text(row):
-    """
-    Fetch the actual notice body for maintenance-time parsing.
+def _clean_maintenance_notice_text(source):
+    """Normalize notice text while removing superseded/struck-out revisions."""
+    raw = unescape(str(source or ""))
 
-    The list API often contains only metadata, so a new/edited temporary
-    maintenance notice can be newer than the last list row that happens to
-    contain a complete time range. We therefore try several public detail
-    shapes and the public board page itself.
+    # HTML strikethrough tags used by board editors.
+    raw = re.sub(
+        r"<(?:s|del|strike)\b[^>]*>.*?</(?:s|del|strike)>",
+        " ", raw, flags=re.I | re.S,
+    )
+    # Styled spans/divs that render as line-through.
+    raw = re.sub(
+        r"<(?P<tag>span|div|p)\b[^>]*(?:text-decoration\s*:\s*line-through|line-through)[^>]*>"
+        r".*?</(?P=tag)>",
+        " ", raw, flags=re.I | re.S,
+    )
+    # Markdown-style strike text can survive JSON/HTML flattening.
+    raw = re.sub(r"~~.*?~~", " ", raw, flags=re.S)
+
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+    raw = re.sub(r"</(?:div|p|li|tr|section|article|h[1-6])>", "\n", raw, flags=re.I)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"[\u00a0\u200b]", " ", raw)
+    raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+    raw = re.sub(r"\n\s*\n+", "\n", raw)
+    return raw.strip()
+
+
+def _maintenance_detail_has_signal(source):
+    """Return True when a fetched detail payload actually contains maintenance timing content."""
+    text = _clean_maintenance_notice_text(source)
+    if not text:
+        return False
+    lowered = text.casefold()
+    if "점검" not in text and "maintenance" not in lowered:
+        return False
+    has_clock = bool(re.search(r"(?<!\d)(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d", text))
+    has_korean_clock = bool(re.search(r"(?<!\d)(?:[01]?\d|2[0-3])\s*시(?:\s*[0-5]?\d\s*분)?", text))
+    has_state = any(token in text for token in ("완료", "종료", "연장", "점검 시간", "점검시간"))
+    has_range = bool(re.search(r"(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d\s*(?:~|∼|～|–|—|-)\s*(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d", text))
+    return bool((has_clock or has_korean_clock) and (has_state or has_range))
+
+
+async def fetch_notice_detail_text(row):
+    """Fetch authoritative notice detail text for maintenance parsing.
+
+    IMPORTANT: list/search metadata is only a fallback. The board list can keep
+    an older scheduled clock for a short time after the actual article body has
+    been edited. Mixing that stale list JSON in front of the current detail body
+    made the parser pick the old time (for example 09:30 instead of 10:00).
+
+    Priority:
+      1) official public article page when it contains timing content,
+      2) official detail API payloads,
+      3) list/search row metadata only when every detail source failed.
     """
     row = row or {}
     content_id = str(row.get("id") or "").strip()
+    title = str(row.get("title") or "")
+    list_fallback = "\n".join([
+        title,
+        str(row.get("rawText") or ""),
+    ]).strip()
     if not content_id:
-        return str(row.get("rawText") or "")
+        return list_fallback
 
     client = await get_http_client()
     alias = BOARD_CONFIGS["공지"]["alias"]
 
-    candidates = [
-        (
-            f"{COMMUNITY_API}/{alias}/article/{content_id}",
-            None,
-        ),
-        (
-            f"{COMMUNITY_API}/{alias}/article/view",
-            {"articleId": content_id},
-        ),
-        (
-            f"{COMMUNITY_API}/{alias}/article/view",
-            {"contentId": content_id},
-        ),
-        (
-            f"{COMMUNITY_API}/{alias}/article/detail",
-            {"articleId": content_id},
-        ),
-        (
-            f"{COMMUNITY_API}/{alias}/article/detail",
-            {"contentId": content_id},
-        ),
+    api_candidates = [
+        (f"{COMMUNITY_API}/{alias}/article/{content_id}", None),
+        (f"{COMMUNITY_API}/{alias}/article/view", {"articleId": content_id}),
+        (f"{COMMUNITY_API}/{alias}/article/view", {"contentId": content_id}),
+        (f"{COMMUNITY_API}/{alias}/article/detail", {"articleId": content_id}),
+        (f"{COMMUNITY_API}/{alias}/article/detail", {"contentId": content_id}),
     ]
 
-    pieces = [
-        str(row.get("title") or ""),
-        str(row.get("rawText") or ""),
-    ]
-
-    for url, params in candidates:
+    api_pieces = []
+    for url, params in api_candidates:
         try:
             response = await client.get(
                 url,
@@ -6912,24 +6944,18 @@ async def fetch_notice_detail_text(row):
             )
             if response.status_code != 200:
                 continue
-
             ctype = str(response.headers.get("content-type") or "").lower()
             if "json" in ctype:
                 data = response.json()
-                pieces.extend(_flatten_text_values(data))
+                piece = "\n".join(str(x) for x in _flatten_text_values(data) if str(x).strip())
             else:
-                body = response.text
-                if body:
-                    pieces.append(body)
-
-            # Do not return merely because the list/title already contains a
-            # scheduled range. During maintenance the same article may be edited
-            # with an extension/completion line later in the body. Keep collecting
-            # detail text so those edits are visible to the parser.
+                piece = str(response.text or "")
+            if piece and _maintenance_detail_has_signal(piece):
+                api_pieces.append(piece)
         except Exception:
             continue
 
-    # Public page fallback. This may work even when another PlayNC endpoint is blocked.
+    page_piece = ""
     page_url = str(row.get("link") or "").strip()
     if page_url:
         try:
@@ -6942,32 +6968,34 @@ async def fetch_notice_detail_text(row):
                 timeout=httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=2.0),
             )
             if response.status_code == 200 and response.text:
-                pieces.append(response.text)
+                candidate = str(response.text)
+                if _maintenance_detail_has_signal(candidate):
+                    page_piece = candidate
         except Exception:
             pass
 
-    return "\n".join(pieces)
+    # The actual public article page is the highest-priority representation.
+    # Do NOT append list_fallback when detail exists; that was the stale-time bug.
+    if page_piece:
+        return (title + "\n" + page_piece).strip()
+
+    if api_pieces:
+        # Keep all successful official detail payloads in request order. Parsers
+        # below intentionally use the LAST valid revision/range, so a later detail
+        # representation can supersede an earlier cached representation.
+        return (title + "\n" + "\n".join(api_pieces)).strip()
+
+    return list_fallback
 
 
 def _parse_maintenance_end_from_text(source, posted_date="", allow_extension=True, allow_completion=True):
     """Parse the effective maintenance completion time from a notice.
 
-    Priority is actual completion > extension end > scheduled range.  Edited
-    notices may retain old times inside <s>/<del>/<strike>; those superseded
-    fragments are removed before parsing.
+    Priority is actual completion > explicit extension end > latest scheduled
+    range. Superseded HTML/Markdown strike text is removed before parsing.
     """
-    raw = unescape(str(source or ""))
+    text = _clean_maintenance_notice_text(source)
     posted = str(posted_date or "").strip()
-
-    # Remove superseded text from edited notices before flattening HTML.
-    text = re.sub(
-        r"<(?:s|del|strike)\b[^>]*>.*?</(?:s|del|strike)>",
-        " ", raw, flags=re.I | re.S,
-    )
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[\u00a0\u200b]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
 
     posted_dt = None
     try:
@@ -6977,57 +7005,34 @@ def _parse_maintenance_end_from_text(source, posted_date="", allow_extension=Tru
         posted_dt = None
     base_year = posted_dt.year if posted_dt is not None else datetime.now(KST).year
 
-    def _resolve_year(month):
-        year = base_year
-        if posted_dt is not None:
-            # Handle notices posted around New Year for a Jan/Dec maintenance.
-            if posted_dt.month == 12 and int(month) == 1:
-                year += 1
-            elif posted_dt.month == 1 and int(month) == 12:
-                year -= 1
-        return year
+    window = _parse_maintenance_window_from_text(text, posted)
+    start_dt = window.get("start")
+    scheduled_end = window.get("scheduledEnd")
 
-    # Scheduled maintenance range. This also gives the date and start clock.
-    range_match = re.search(
-        r"(?P<month>\d{1,2})\s*[/.]\s*(?P<day>\d{1,2})"
-        r"(?:\s*\([^)]*\))?"
-        r".{0,220}?"
-        r"(?P<sh>\d{1,2})\s*[:：]\s*(?P<sm>\d{2})"
-        r"\s*(?:~|∼|～|–|—|-)\s*"
-        r"(?P<eh>\d{1,2})\s*[:：]\s*(?P<em>\d{2})",
-        text, re.I | re.S,
-    )
-
-    month = day = sh = sm = None
-    scheduled_end = None
-    if range_match:
-        try:
-            month = int(range_match.group("month"))
-            day = int(range_match.group("day"))
-            sh = int(range_match.group("sh"))
-            sm = int(range_match.group("sm"))
-            eh = int(range_match.group("eh"))
-            em = int(range_match.group("em"))
-            year = _resolve_year(month)
-            start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
-            scheduled_end = datetime(year, month, day, eh, em, tzinfo=KST)
-            if scheduled_end <= start_dt:
-                scheduled_end += timedelta(days=1)
-        except Exception:
-            scheduled_end = None
-
-    # If the full range was not found, recover the notice's month/day.
-    if month is None or day is None:
+    month = day = None
+    if start_dt is not None:
+        month, day = start_dt.month, start_dt.day
+    else:
+        # Recover date from either 9/9 or 9월 9일 notation.
         dm = re.search(r"(?<!\d)(\d{1,2})\s*[/.]\s*(\d{1,2})(?!\d)", text)
+        if not dm:
+            dm = re.search(r"(?<!\d)(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
         if dm:
             try:
                 month, day = int(dm.group(1)), int(dm.group(2))
             except Exception:
                 month = day = None
-
-    # Use post date only as a last-resort date anchor.
     if (month is None or day is None) and posted_dt is not None:
         month, day = posted_dt.month, posted_dt.day
+
+    def _resolve_year(month_value):
+        year = base_year
+        if posted_dt is not None:
+            if posted_dt.month == 12 and int(month_value) == 1:
+                year += 1
+            elif posted_dt.month == 1 and int(month_value) == 12:
+                year -= 1
+        return year
 
     clock_pattern = (
         r"(?P<h>[01]?\d|2[0-3])"
@@ -7046,33 +7051,35 @@ def _parse_maintenance_end_from_text(source, posted_date="", allow_extension=Tru
             pass
         return None
 
-    # Actual completion/ending is authoritative, including "점검 종료 7시 30분".
-    completion_patterns = [
-        r"(?:정기\s*)?점검(?:이|이\s*)?\s*(?:완료|종료)(?:\s*(?:시간|시각))?\s*[:：-]?\s*.{0,45}?" + clock_pattern,
-        r"(?:정기\s*)?점검.{0,80}?" + clock_pattern + r"\s*(?:에|부터)?\s*(?:완료|종료)(?:되었습니다|됐습니다|됨|되었)?",
-        clock_pattern + r"\s*현재.{0,140}?(?:정상적으로\s*게임\s*이용|점검(?:이)?\s*(?:완료|종료))",
-    ]
-    completion_clock = None
-    if allow_completion:
-        for pattern in completion_patterns:
-            completion_clock = _clock_from_match(re.search(pattern, text, re.I | re.S))
-            if completion_clock is not None:
-                break
+    def _last_clock_for_patterns(patterns):
+        hits = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, re.I | re.S):
+                clock = _clock_from_match(match)
+                if clock is not None:
+                    hits.append((match.start(), clock))
+        if not hits:
+            return None
+        hits.sort(key=lambda item: item[0])
+        return hits[-1][1]
 
-    # Extension text is authoritative ONLY when the caller already verified
-    # that this is an actual extension notice (normally title contains "연장").
-    # This prevents boilerplate such as "점검이 연장될 수 있습니다" from
-    # changing the official schedule.
+    # Actual completion is authoritative. Include NC-style wording such as
+    # "10:00 점검이 완료되어 게임 접속이 가능합니다.".
+    completion_patterns = [
+        r"(?:정기\s*)?점검(?:이|을)?\s*(?:완료|종료)\s*(?:(?:시간|시각)\s*)?[:：-]?\s*" + clock_pattern,
+        r"(?:정기\s*)?점검.{0,80}?" + clock_pattern + r"\s*(?:에|부터)?\s*(?:완료|종료)(?:되었습니다|됐습니다|됨|되었)?",
+        clock_pattern + r"\s*(?:에\s*)?(?:정기\s*)?점검(?:이|을)?\s*(?:완료|종료)(?:되어|되어서|되었습니다|됐습니다|됨|되었)?",
+        clock_pattern + r"\s*현재.{0,140}?(?:정상적으로\s*게임\s*이용|게임\s*접속|점검(?:이)?\s*(?:완료|종료))",
+    ]
+    completion_clock = _last_clock_for_patterns(completion_patterns) if allow_completion else None
+
+    # Extension text is authoritative ONLY after the caller has classified the
+    # TITLE as an actual extension notice. Boilerplate "연장될 수 있습니다" is ignored.
     extension_patterns = [
         r"연장.{0,180}?" + clock_pattern + r"\s*(?:에|까지)?\s*(?:종료|완료)(?:\s*예정)?",
         r"연장.{0,180}?(?:종료|완료)(?:\s*예정)?\s*[:：-]?\s*" + clock_pattern,
     ]
-    extension_clock = None
-    if allow_extension:
-        for pattern in extension_patterns:
-            extension_clock = _clock_from_match(re.search(pattern, text, re.I | re.S))
-            if extension_clock is not None:
-                break
+    extension_clock = _last_clock_for_patterns(extension_patterns) if allow_extension else None
 
     effective_clock = completion_clock or extension_clock
     if effective_clock is not None and month is not None and day is not None:
@@ -7080,10 +7087,8 @@ def _parse_maintenance_end_from_text(source, posted_date="", allow_extension=Tru
             eh, em = effective_clock
             year = _resolve_year(month)
             end_dt = datetime(year, month, day, eh, em, tzinfo=KST)
-            if sh is not None and sm is not None:
-                start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
-                if end_dt <= start_dt:
-                    end_dt += timedelta(days=1)
+            if start_dt is not None and end_dt <= start_dt:
+                end_dt += timedelta(days=1)
             return end_dt
         except Exception:
             pass
@@ -7131,38 +7136,26 @@ def _maintenance_notice_title_kind(title):
 
 
 def _has_definitive_maintenance_completion_text(source):
-    """True only for wording that says maintenance actually ended/completed.
-
-    This deliberately rejects generic phrases such as "점검 종료 후" and
-    possibility/plan wording. It is used when the original maintenance article
-    is edited without changing its title.
-    """
-    raw = unescape(str(source or ""))
-    plain = re.sub(r"<(?:s|del|strike)\b[^>]*>.*?</(?:s|del|strike)>", " ", raw, flags=re.I | re.S)
-    plain = re.sub(r"<br\s*/?>", "\n", plain, flags=re.I)
-    plain = re.sub(r"<[^>]+>", " ", plain)
-    plain = re.sub(r"\s+", " ", plain).strip()
-
+    """True only for wording that says maintenance actually ended/completed."""
+    plain = _clean_maintenance_notice_text(source)
     patterns = (
-        r"점검(?:이|을)?\s*.{0,80}?(?:종료|완료)\s*(?:되었습니다|됐습니다|되었으며|됐으며|했습니다|하였습니다|됨)",
+        r"점검(?:이|을)?\s*.{0,80}?(?:종료|완료)\s*(?:되었습니다|됐습니다|되었으며|됐으며|했습니다|하였습니다|됨|되어)",
         r"점검(?:을)?\s*.{0,80}?(?:종료|완료)\s*하였습니다",
         r"(?:조기\s*)?(?:종료|완료)된\s*점검",
+        r"(?<!\d)(?:[01]?\d|2[0-3])\s*[:：]\s*[0-5]\d\s*(?:에\s*)?점검(?:이|을)?\s*(?:완료|종료)",
     )
-    return any(re.search(p, plain, re.I) for p in patterns)
+    return any(re.search(p, plain, re.I | re.S) for p in patterns)
 
 
 def _parse_maintenance_window_from_text(source, posted_date=""):
-    """Return the scheduled maintenance start/end from a notice range."""
-    raw = unescape(str(source or ""))
+    """Return the latest explicit scheduled maintenance start/end range.
+
+    A notice or combined detail payload can contain multiple revisions. We scan
+    every valid range and use the LAST live (non-struck-out) one instead of the
+    first one. This is critical when 04:30~09:30 is superseded by 04:30~10:00.
+    """
+    text = _clean_maintenance_notice_text(source)
     posted = str(posted_date or "").strip()
-    text = re.sub(
-        r"<(?:s|del|strike)\b[^>]*>.*?</(?:s|del|strike)>",
-        " ", raw, flags=re.I | re.S,
-    )
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[\u00a0\u200b]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
 
     posted_dt = None
     try:
@@ -7172,7 +7165,9 @@ def _parse_maintenance_window_from_text(source, posted_date=""):
         posted_dt = None
     base_year = posted_dt.year if posted_dt is not None else datetime.now(KST).year
 
-    def _resolve_year(month):
+    def _resolve_year(month, explicit_year=None):
+        if explicit_year:
+            return int(explicit_year)
         year = base_year
         if posted_dt is not None:
             if posted_dt.month == 12 and int(month) == 1:
@@ -7181,33 +7176,42 @@ def _parse_maintenance_window_from_text(source, posted_date=""):
                 year -= 1
         return year
 
-    match = re.search(
-        r"(?P<month>\d{1,2})\s*[/.]\s*(?P<day>\d{1,2})"
-        r"(?:\s*\([^)]*\))?"
-        r".{0,220}?"
+    date_prefixes = [
+        r"(?:(?P<year>\d{4})\s*[./-]\s*)?(?P<month>\d{1,2})\s*[/.]\s*(?P<day>\d{1,2})(?:\s*\([^)]*\))?",
+        r"(?:(?P<year>\d{4})\s*년\s*)?(?P<month>\d{1,2})\s*월\s*(?P<day>\d{1,2})\s*일(?:\s*\([^)]*\))?",
+    ]
+    tail = (
+        r".{0,260}?"
         r"(?P<sh>\d{1,2})\s*[:：]\s*(?P<sm>\d{2})"
         r"\s*(?:~|∼|～|–|—|-)\s*"
-        r"(?P<eh>\d{1,2})\s*[:：]\s*(?P<em>\d{2})",
-        text, re.I | re.S,
+        r"(?P<eh>\d{1,2})\s*[:：]\s*(?P<em>\d{2})"
     )
-    if not match:
+
+    found = []
+    for date_prefix in date_prefixes:
+        for match in re.finditer(date_prefix + tail, text, re.I | re.S):
+            try:
+                month = int(match.group("month"))
+                day = int(match.group("day"))
+                sh = int(match.group("sh"))
+                sm = int(match.group("sm"))
+                eh = int(match.group("eh"))
+                em = int(match.group("em"))
+                year = _resolve_year(month, match.groupdict().get("year"))
+                start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
+                end_dt = datetime(year, month, day, eh, em, tzinfo=KST)
+                if end_dt <= start_dt:
+                    end_dt += timedelta(days=1)
+                found.append((match.start(), start_dt, end_dt))
+            except Exception:
+                continue
+
+    if not found:
         return {"start": None, "scheduledEnd": None}
 
-    try:
-        month = int(match.group("month"))
-        day = int(match.group("day"))
-        sh = int(match.group("sh"))
-        sm = int(match.group("sm"))
-        eh = int(match.group("eh"))
-        em = int(match.group("em"))
-        year = _resolve_year(month)
-        start_dt = datetime(year, month, day, sh, sm, tzinfo=KST)
-        end_dt = datetime(year, month, day, eh, em, tzinfo=KST)
-        if end_dt <= start_dt:
-            end_dt += timedelta(days=1)
-        return {"start": start_dt, "scheduledEnd": end_dt}
-    except Exception:
-        return {"start": None, "scheduledEnd": None}
+    found.sort(key=lambda item: item[0])
+    _, start_dt, end_dt = found[-1]
+    return {"start": start_dt, "scheduledEnd": end_dt}
 
 # Manual corrections are intentionally isolated from the rest of the bot.
 # They survive normal requests/reloads on the same Render instance.  A full
@@ -7299,12 +7303,27 @@ def _maintenance_runtime_snapshot(now=None, persist_transition=True):
     end = info.get("end")
     last_start = info.get("lastStart")
     last_end = info.get("lastEnd")
+    change_kind = str(info.get("changeKind") or "")
 
     active = bool(start is not None and end is not None and start <= now < end)
     scheduled = bool(start is not None and end is not None and now < start)
 
-    # Once the end is reached, remember the exact interval. This is the guard
-    # that prevents 30m/10m (or custom lead) catch-up after maintenance.
+    # A scheduled clock reaching its end is not proof that NC made no late edit.
+    # Keep checking the official notice every minute for a bounded confirmation
+    # window after the expected end. This catches a 09:30 -> 10:00 edit even if
+    # our previously stored runtime already crossed 09:30.
+    confirmed_kind = change_kind in ("completion", "early_end")
+    awaiting_confirmation = bool(
+        start is not None
+        and end is not None
+        and now >= end
+        and not confirmed_kind
+        and now < end + timedelta(hours=3)
+    )
+
+    # Once the currently known end is reached, remember the interval so phones
+    # discard lead-alert catch-up from inside maintenance. If a later official
+    # edit moves the end, _save_maintenance_runtime updates this interval again.
     if start is not None and end is not None and now >= end:
         if last_start != start or last_end != end:
             last_start, last_end = start, end
@@ -7317,10 +7336,23 @@ def _maintenance_runtime_snapshot(now=None, persist_transition=True):
                 data["maintenanceRuntime"] = row
                 _save_boss_schedule_overrides(data)
 
+    if active:
+        status = "active"
+    elif scheduled:
+        status = "scheduled"
+    elif awaiting_confirmation:
+        status = "awaiting_confirmation"
+    elif start is not None and end is not None and now >= end:
+        status = "completed"
+    else:
+        status = "idle"
+
     return {
         **info,
         "active": active,
         "scheduled": scheduled,
+        "awaitingConfirmation": awaiting_confirmation,
+        "status": status,
         "lastStart": last_start,
         "lastEnd": last_end,
     }
@@ -7808,24 +7840,20 @@ def _set_manual_schedule(name, hour, minute):
 async def latest_maintenance_anchor():
     """Maintenance anchor + live maintenance tracking policy.
 
-    Important rules:
-    - Normal notices establish the scheduled maintenance window.
-    - EXTENSION is accepted only from a title that actually announces "연장".
-      Boilerplate body text such as "연장될 수 있습니다" is ignored.
-    - If the SAME maintenance article's explicit scheduled end changes (for
-      example 09:30 -> 10:00), accept the new clock as a generic time change
-      even when the title does not contain "연장". It is not labeled as an
-      extension unless the title itself announces one.
-    - Strong official completion/early-end news may move the end earlier.
-    - During an active maintenance the source is rechecked every 60 seconds.
-    - Kaira and Nahma stay fixed; maintenance-based schedules keep the existing
-      rebase behavior when the confirmed completion time changes.
+    Rules:
+    - Detail/article body outranks board-list metadata.
+    - Same article explicit range changes are authoritative even without "연장".
+    - "연장" is an extension only when the TITLE actually announces it.
+    - Definitive completion/early-end wording can move the anchor earlier.
+    - Active or awaiting-confirmation maintenance is rechecked every 60 seconds.
+    - Kaira/Nahma remain fixed; existing maintenance-dependent rebase is preserved.
     """
     now = datetime.now(KST)
     now_ts = time.time()
     runtime_before = _maintenance_runtime_snapshot(now=now, persist_transition=True)
     active_now = bool(runtime_before.get("active"))
-    cache_ttl = 60 if active_now else 300
+    awaiting_now = bool(runtime_before.get("awaitingConfirmation"))
+    cache_ttl = 60 if (active_now or awaiting_now) else 300
 
     cached = _maintenance_anchor_cache.get("value")
     cached_ts = float(_maintenance_anchor_cache.get("ts") or 0)
@@ -7874,7 +7902,9 @@ async def latest_maintenance_anchor():
                 continue
 
             effective_kind = title_kind
-            if title_kind == "schedule" and definitive_completion and scheduled_end is not None and parsed != scheduled_end:
+            if title_kind == "schedule" and definitive_completion:
+                # Completion at exactly the scheduled end is still a confirmation,
+                # not merely an ordinary schedule row.
                 effective_kind = "completion"
 
             candidates.append({
@@ -7889,7 +7919,6 @@ async def latest_maintenance_anchor():
                 "titleKind": title_kind,
             })
 
-        # Board rows are already time-sorted, but make the rule explicit.
         candidates.sort(
             key=lambda c: c.get("postedAt").timestamp() if c.get("postedAt") is not None else 0.0,
             reverse=True,
@@ -7910,7 +7939,6 @@ async def latest_maintenance_anchor():
                 or c.get("postedAt") >= persisted_posted
             )
 
-            # Explicit extension: title must say 연장, and end must actually move later.
             if kind == "extension":
                 if persisted_anchor is not None and end_dt <= persisted_anchor:
                     continue
@@ -7921,23 +7949,20 @@ async def latest_maintenance_anchor():
                 chosen = c
                 break
 
-            # Explicit/definitive completion can move earlier or later. A separate
-            # article may roll backward only when it belongs to the current date.
             if kind in ("early_end", "completion"):
-                if persisted_anchor is not None and end_dt == persisted_anchor:
-                    continue
+                # Same anchor + completion is still useful: it ends the
+                # awaiting-confirmation state even though the clock did not move.
                 if persisted_anchor is not None and not same_day:
                     continue
                 if not same_source and not newer_source:
                     continue
+                if persisted_anchor is not None and end_dt == persisted_anchor:
+                    current_kind = str(persisted_info.get("changeKind") or "")
+                    if current_kind in ("completion", "early_end"):
+                        continue
                 chosen = c
                 break
 
-            # Same ordinary maintenance article: an explicit scheduled-range
-            # clock change is authoritative, but it is a generic time change, NOT
-            # an extension unless the TITLE itself says "연장". This keeps
-            # boilerplate such as "연장될 수 있습니다" from triggering anything
-            # while still following an official 09:30 -> 10:00 edit.
             if same_source:
                 if persisted_anchor is not None and end_dt == persisted_anchor:
                     continue
@@ -7947,8 +7972,8 @@ async def latest_maintenance_anchor():
                 chosen["kind"] = "schedule_change"
                 break
 
-        # 2) If there was no current-change notice, accept a genuinely new normal
-        # scheduled maintenance only when its completion is later than the last one.
+        # 2) New normal maintenance source. Do not allow an older normal notice
+        # to roll the anchor backward.
         if chosen is None:
             for c in candidates:
                 if c["kind"] != "schedule":
@@ -7969,16 +7994,18 @@ async def latest_maintenance_anchor():
         source_posted_text = chosen.get("postedAtText") or ""
         change_kind = chosen.get("kind") or "schedule"
 
-        # Keep the current maintenance start for extension/completion articles
-        # that only publish a revised end clock.
         chosen_start = chosen.get("start")
         if chosen_start is None and runtime_start is not None and runtime_end is not None:
             if abs((official_anchor.date() - runtime_end.date()).days) <= 1:
                 chosen_start = runtime_start
 
-        _bind_or_rebase_maintenance_schedules(
-            persisted_anchor, official_anchor, source_id, source_title
-        )
+        # Rebase only when the anchor actually moved. A same-time completion
+        # merely confirms the runtime and must not shift schedules twice.
+        if persisted_anchor is None or official_anchor != persisted_anchor:
+            _bind_or_rebase_maintenance_schedules(
+                persisted_anchor, official_anchor, source_id, source_title
+            )
+
         force_backward = bool(
             persisted_anchor is not None
             and official_anchor < persisted_anchor
