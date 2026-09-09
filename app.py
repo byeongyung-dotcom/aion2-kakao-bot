@@ -6922,9 +6922,10 @@ async def fetch_notice_detail_text(row):
                 if body:
                     pieces.append(body)
 
-            joined = "\n".join(pieces)
-            if _parse_maintenance_end_from_text(joined, row.get("date")) is not None:
-                return joined
+            # Do not return merely because the list/title already contains a
+            # scheduled range. During maintenance the same article may be edited
+            # with an extension/completion line later in the body. Keep collecting
+            # detail text so those edits are visible to the parser.
         except Exception:
             continue
 
@@ -7811,6 +7812,10 @@ async def latest_maintenance_anchor():
     - Normal notices establish the scheduled maintenance window.
     - EXTENSION is accepted only from a title that actually announces "연장".
       Boilerplate body text such as "연장될 수 있습니다" is ignored.
+    - If the SAME maintenance article's explicit scheduled end changes (for
+      example 09:30 -> 10:00), accept the new clock as a generic time change
+      even when the title does not contain "연장". It is not labeled as an
+      extension unless the title itself announces one.
     - Strong official completion/early-end news may move the end earlier.
     - During an active maintenance the source is rechecked every 60 seconds.
     - Kaira and Nahma stay fixed; maintenance-based schedules keep the existing
@@ -7928,10 +7933,19 @@ async def latest_maintenance_anchor():
                 chosen = c
                 break
 
-            # Same ordinary article with only a changed scheduled range is NOT an
-            # extension. This is the user's strict "title must say 연장" rule.
+            # Same ordinary maintenance article: an explicit scheduled-range
+            # clock change is authoritative, but it is a generic time change, NOT
+            # an extension unless the TITLE itself says "연장". This keeps
+            # boilerplate such as "연장될 수 있습니다" from triggering anything
+            # while still following an official 09:30 -> 10:00 edit.
             if same_source:
-                continue
+                if persisted_anchor is not None and end_dt == persisted_anchor:
+                    continue
+                if persisted_anchor is not None and not same_day:
+                    continue
+                chosen = dict(c)
+                chosen["kind"] = "schedule_change"
+                break
 
         # 2) If there was no current-change notice, accept a genuinely new normal
         # scheduled maintenance only when its completion is later than the last one.
@@ -10061,6 +10075,8 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     change_header = "🔧 점검 연장"
                 elif change_kind in ("early_end", "completion") and shift < 0:
                     change_header = "✅ 점검 조기 종료"
+                elif change_kind == "schedule_change":
+                    change_header = "🔧 점검 시간 변경"
                 else:
                     change_header = "🔧 아그로 시간 변경"
                 maintenance_message = (
