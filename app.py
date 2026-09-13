@@ -273,7 +273,16 @@ def parse_character_query(text: str):
     m = re.match(r"^(.+?)\[(.+?)\]$", text)
     if not m:
         return text, None
-    return m.group(1).strip(), m.group(2).strip()
+    nickname = m.group(1).strip()
+    server_token = m.group(2).strip()
+    # Server aliases are normalized after SERVER_NAMES is initialized.  Keep an
+    # unknown token intact so an explicit [server] query still fails cleanly
+    # instead of silently becoming an all-server nickname search.
+    try:
+        server_name = resolve_server_alias(server_token) or server_token
+    except Exception:
+        server_name = server_token
+    return nickname, server_name
 
 def row_name(row):
     return str(row.get("name") or row.get("characterName") or "").strip()
@@ -632,6 +641,95 @@ for index, name in enumerate(SERVER_NAMES_ASMODIAN):
     SERVER_ID_MAP[name] = 2001 + index
 
 SERVER_NAMES = tuple(SERVER_ID_MAP.keys())
+
+
+# Character-search server aliases.
+#
+# The chat command accepts a server before OR after a nickname.  Players also
+# commonly shorten long server names, so create conservative aliases from the
+# official server list instead of hard-coding nicknames:
+#   나니아   -> 나니      (two-syllable prefix)
+#   마르쿠탄 -> 마르 / 마탄 (prefix / first+last)
+# A generated alias is used only when it identifies exactly one server.
+# Ambiguous abbreviations are intentionally ignored to prevent a character name
+# from being cut at the wrong position.
+def _server_alias_norm(value):
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _build_server_alias_maps():
+    candidates = defaultdict(set)
+
+    for server in SERVER_NAMES:
+        name = str(server or "").strip()
+        if not name:
+            continue
+
+        # Natural prefixes: 2 chars up to one char before the full name.
+        # This covers 나니아 -> 나니, 마르쿠탄 -> 마르/마르쿠, etc.
+        for size in range(2, len(name)):
+            candidates[_server_alias_norm(name[:size])].add(name)
+
+        # Compact edge alias: remove the middle characters.
+        # Example pattern: 마르쿠스 -> 마스.  For the actual server
+        # 마르쿠탄 this becomes 마탄.
+        if len(name) >= 3:
+            candidates[_server_alias_norm(name[0] + name[-1])].add(name)
+
+    unique = {}
+    ambiguous = set()
+    for alias, names in candidates.items():
+        if len(names) == 1:
+            unique[alias] = next(iter(names))
+        elif len(names) > 1:
+            ambiguous.add(alias)
+
+    return unique, ambiguous
+
+
+SERVER_ALIAS_MAP, SERVER_ALIAS_AMBIGUOUS = _build_server_alias_maps()
+
+
+def resolve_server_alias(value):
+    """Return the canonical AION2 server name for an exact/unique alias."""
+    token = str(value or "").strip()
+    if not token:
+        return None
+
+    folded = token.casefold()
+    for server in SERVER_NAMES:
+        if server.casefold() == folded:
+            return server
+
+    return SERVER_ALIAS_MAP.get(_server_alias_norm(token))
+
+
+def _server_parse_tokens(include_aliases=True):
+    """Build prefix/suffix tokens ordered by confidence and token length."""
+    rows = []
+    seen = set()
+
+    # Full server names always have highest confidence.
+    for server in SERVER_NAMES:
+        token = str(server)
+        key = (_server_alias_norm(token), server)
+        if key not in seen:
+            seen.add(key)
+            rows.append((token, server, True))
+
+    if include_aliases:
+        for alias_key, server in SERVER_ALIAS_MAP.items():
+            # alias_key is normalized Korean text for our generated aliases.
+            # It is safe to use as the slicing token because aliases contain no
+            # spaces or punctuation.
+            key = (alias_key, server)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((alias_key, server, False))
+
+    rows.sort(key=lambda x: (0 if x[2] else 1, -len(x[0]), x[1]))
+    return rows
 
 
 # =========================================================
@@ -1392,7 +1490,8 @@ async def _fresh_official_character(nickname, server_name=None):
 async def own_resolve_character(nickname, server_name=None):
     """Direct lookup: NC official live data first, DB only as last fallback."""
     nickname = str(nickname or "").strip()
-    server_name = str(server_name or "").strip() or None
+    raw_server_name = str(server_name or "").strip()
+    server_name = (resolve_server_alias(raw_server_name) or raw_server_name) if raw_server_name else None
 
     # Fastest/latest path for a server-specific lookup: if we already know the
     # official characterId, skip the search API and fetch live character info
@@ -1548,30 +1647,10 @@ async def _lookup_detail_with_saved_stones(resolved, nickname, server_name=None)
 async def own_character_lookup_smart(body):
     body = str(body or "").strip()
 
-    nickname, explicit_server = parse_character_query(body)
-
-    if explicit_server:
-        resolved = await own_resolve_character(
-            nickname,
-            explicit_server,
-        )
-
-    else:
-        parsed = split_server_and_nickname(body)
-
-        if parsed:
-            nickname, server_name = parsed
-            resolved = await own_resolve_character(
-                nickname,
-                server_name,
-            )
-
-        else:
-            nickname = body
-            resolved = await own_resolve_character(
-                nickname,
-                None,
-            )
+    nickname, server_name, resolved = await _resolve_character_query_smart(
+        body,
+        own_resolve_character,
+    )
 
     if resolved.get("type") == "none":
         return None
@@ -2100,6 +2179,8 @@ async def official_load_detail(row):
 
 
 async def official_resolve_character(nickname, server_name=None):
+    raw_server_name = str(server_name or "").strip()
+    server_name = (resolve_server_alias(raw_server_name) or raw_server_name) if raw_server_name else None
     rows = await official_search_characters(
         nickname,
         server_name=server_name,
@@ -2153,32 +2234,10 @@ async def official_resolve_character(nickname, server_name=None):
 async def official_character_lookup_smart(body):
     body = str(body or "").strip()
 
-    nickname, explicit_server = parse_character_query(body)
-
-    if explicit_server:
-        resolved = await official_resolve_character(
-            nickname,
-            explicit_server,
-        )
-
-    else:
-        parsed = split_server_and_nickname(body)
-
-        if parsed:
-            nickname, server_name = parsed
-
-            resolved = await official_resolve_character(
-                nickname,
-                server_name,
-            )
-
-        else:
-            nickname = body
-
-            resolved = await official_resolve_character(
-                nickname,
-                None,
-            )
+    nickname, server_name, resolved = await _resolve_character_query_smart(
+        body,
+        official_resolve_character,
+    )
 
     if resolved["type"] == "none":
         return None
@@ -2195,32 +2254,94 @@ async def official_character_lookup_smart(body):
     )
 
 
-def split_server_and_nickname(text: str):
-    """
-    서버명을 닉네임 앞/뒤 어느 쪽에 붙여도 인식.
-      윤이시엘 -> ("윤이", "시엘")
-      시엘윤이 -> ("윤이", "시엘")
-      윤이지켈 -> ("윤이", "지켈")
-      지켈윤이 -> ("윤이", "지켈")
+def split_server_and_nickname_candidates(text: str, include_aliases=True):
+    """Return every plausible (nickname, canonical_server, exact_server) split.
+
+    Full server names are returned first, followed by unique abbreviations.
+    Both prefix and suffix forms are accepted.  Returning candidates instead of
+    one irreversible split is important for unusual nicknames that themselves
+    begin/end with a server-like string.
     """
     text = str(text or "").strip()
+    if not text:
+        return []
+
     folded = text.casefold()
+    out = []
+    seen = set()
 
-    # 긴 서버명을 먼저 검사해서 짧은 이름 오인식 최소화
-    for server in sorted(SERVER_NAMES, key=len, reverse=True):
-        sf = server.casefold()
+    for token, server, is_exact in _server_parse_tokens(include_aliases=include_aliases):
+        tf = token.casefold()
 
-        if folded.startswith(sf) and len(text) > len(server):
-            nickname = text[len(server):].strip()
-            if nickname:
-                return nickname, server
+        if folded.startswith(tf) and len(text) > len(token):
+            nickname = text[len(token):].strip()
+            # A two-syllable alias such as 나니 must not split the nickname
+            # 나니아 into server=나니아 + nickname=아.  Generated aliases
+            # therefore require at least a two-character nickname remainder.
+            if nickname and (is_exact or len(nickname) >= 2):
+                key = (nickname.casefold(), server)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((nickname, server, is_exact))
 
-        if folded.endswith(sf) and len(text) > len(server):
-            nickname = text[:-len(server)].strip()
-            if nickname:
-                return nickname, server
+        if folded.endswith(tf) and len(text) > len(token):
+            nickname = text[:-len(token)].strip()
+            if nickname and (is_exact or len(nickname) >= 2):
+                key = (nickname.casefold(), server)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((nickname, server, is_exact))
 
-    return None
+    return out
+
+
+def split_server_and_nickname(text: str):
+    """Backward-compatible best split for callers that only need one result."""
+    candidates = split_server_and_nickname_candidates(text, include_aliases=True)
+    if not candidates:
+        return None
+    nickname, server, _ = candidates[0]
+    return nickname, server
+
+
+async def _resolve_character_query_smart(body, resolver):
+    """Resolve server-before/server-after input without destroying odd nicknames.
+
+    Order:
+    1) explicit nickname[server/alias]
+    2) full server-name prefix/suffix candidates
+    3) unique abbreviation prefix/suffix candidates
+    4) original whole text as a nickname fallback
+
+    Crucially, a failed server split never ends the search.  The original text is
+    retried as the nickname, which fixes names that happen to start/end with a
+    server name or server abbreviation.
+    """
+    body = str(body or "").strip()
+    nickname, explicit_server = parse_character_query(body)
+
+    if explicit_server:
+        canonical = resolve_server_alias(explicit_server) or explicit_server
+        resolved = await resolver(nickname, canonical)
+        return nickname, canonical, resolved
+
+    candidates = split_server_and_nickname_candidates(body, include_aliases=True)
+
+    # Full names before abbreviations; _server_parse_tokens already preserves
+    # that ordering, but keep the sort explicit for future edits.
+    candidates.sort(key=lambda x: (0 if x[2] else 1, -len(x[1]), x[1]))
+
+    for candidate_nickname, server_name, _is_exact in candidates[:6]:
+        try:
+            resolved = await resolver(candidate_nickname, server_name)
+        except Exception:
+            continue
+        if isinstance(resolved, dict) and resolved.get("type") != "none":
+            return candidate_nickname, server_name, resolved
+
+    # Do not let a false prefix/suffix split break a special nickname.
+    resolved = await resolver(body, None)
+    return body, None, resolved
 
 
 async def search_character_on_server(nickname: str, server_name: str):
@@ -2229,6 +2350,7 @@ async def search_character_on_server(nickname: str, server_name: str):
     1) serverId를 넣은 검색을 먼저 시도
     2) 결과가 없으면 전 서버 검색으로 fallback
     """
+    server_name = resolve_server_alias(server_name) or str(server_name or "").strip()
     target_id = SERVER_ID_MAP.get(server_name)
     target_name = server_name.casefold()
     target_nickname = nickname.casefold()
@@ -2295,7 +2417,8 @@ async def search_character_on_server(nickname: str, server_name: str):
 
 async def character_lookup_server_fast(nickname: str, server_name: str):
     nickname = str(nickname or "").strip()
-    server_name = str(server_name or "").strip()
+    raw_server_name = str(server_name or "").strip()
+    server_name = resolve_server_alias(raw_server_name) or raw_server_name
 
     if not nickname or server_name not in SERVER_ID_MAP:
         return None
@@ -6314,19 +6437,9 @@ async def ranking_lookup_smart(body: str):
     if not body:
         return "사용법\n!랭킹 윤이지켈\n!랭킹 지켈윤이"
 
-    nickname, explicit_server = parse_character_query(body)
-    server_name = explicit_server
-
-    if not server_name:
-        parsed = split_server_and_nickname(body)
-        if parsed:
-            nickname, server_name = parsed
-        else:
-            nickname = body
-
-    resolved = await own_resolve_character(
-        nickname,
-        server_name,
+    nickname, server_name, resolved = await _resolve_character_query_smart(
+        body,
+        own_resolve_character,
     )
 
     if resolved["type"] == "none":
