@@ -1238,8 +1238,18 @@ async def _save_notmeter_resolved(resolved):
     if not isinstance(resolved, dict):
         return
 
+    def clean_info_for_db(value):
+        # Identity-only first hits can legitimately have no class/CP yet.  Never
+        # persist UI placeholders as if they were real character data; otherwise
+        # the OG card keeps showing "확인 실패" even after the identity is known.
+        info = dict(value or {})
+        job = str(info.get("job") or "").strip()
+        if job in ("확인 실패", "AION2 캐릭터", "정보 갱신 중"):
+            info["job"] = ""
+        return info
+
     if resolved.get("type") == "detail":
-        info = resolved.get("info") or {}
+        info = clean_info_for_db(resolved.get("info"))
         row = resolved.get("row") or {}
         await character_db_upsert(
             info,
@@ -1250,7 +1260,7 @@ async def _save_notmeter_resolved(resolved):
 
     if resolved.get("type") == "multiple":
         for item in resolved.get("items") or []:
-            info = item.get("info") or {}
+            info = clean_info_for_db(item.get("info"))
             row = item.get("row") or {}
             await character_db_upsert(
                 info,
@@ -1558,6 +1568,18 @@ async def own_resolve_character(nickname, server_name=None):
                         enriched = _official_info_from_live_data(row, detail)
                         if str(enriched.get("name") or "").casefold() == nickname.casefold():
                             info = enriched
+                            # Persist the successful enrichment.  The previous code
+                            # returned the fresh CP/job to this one request but left
+                            # the DB at CP=0 / job="확인 실패", so the card loaded
+                            # immediately afterwards from the stale identity row.
+                            try:
+                                await character_db_upsert(
+                                    info,
+                                    character_id=cid,
+                                    source="plaync-official",
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     return {
@@ -11821,18 +11843,109 @@ async def _start_pwa_push_background():
         PWA_PUSH_BACKGROUND_TASK = asyncio.create_task(_pwa_push_background_loop())
 
 
-async def character_card_data_fast(nickname: str, server_name: str):
-    """Fast OG-card snapshot. Never perform the expensive equipment-item crawl here."""
+def _card_info_incomplete(info):
+    info = dict(info or {})
+    try:
+        cp = int(info.get("combatPower") or 0)
+    except Exception:
+        cp = 0
+    job = str(info.get("job") or info.get("className") or "").strip()
+    return cp <= 0 or job in ("", "확인 실패", "AION2 캐릭터", "정보 갱신 중")
+
+
+def _merge_card_info(base, fresh):
+    """Merge only meaningful fresh values; never replace a good DB value by 0/blank."""
+    out = dict(base or {})
+    fresh = dict(fresh or {})
+    for key in ("name", "server", "characterId", "job", "profileImage", "race", "officialUrl"):
+        value = fresh.get(key)
+        if value not in (None, "", "확인 실패", "AION2 캐릭터", "정보 갱신 중"):
+            out[key] = value
+    for key in ("serverId", "combatPower", "itemLevel", "level"):
+        try:
+            value = int(fresh.get(key) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            out[key] = value
+    return out
+
+
+async def _refresh_card_basic_info(nickname: str, server_name: str, seed_info=None):
+    """Refresh only basic identity/CP/job.  Never crawl equipment here."""
     nickname = str(nickname or "").strip()
-    server_name = str(server_name or "").strip()
+    server_name = resolve_server_alias(server_name) or str(server_name or "").strip()
+    if not nickname or server_name not in SERVER_ID_MAP:
+        return dict(seed_info or {})
+
+    info = dict(seed_info or {})
+    sid = int(info.get("serverId") or SERVER_ID_MAP.get(server_name) or 0)
+    cid = str(info.get("characterId") or "").strip()
+
+    # Best path: once identity is known, character/info is one request and gives
+    # the authoritative combat power/class used by the card header.
+    if sid and cid:
+        row = {
+            "name": info.get("name") or nickname,
+            "serverName": info.get("server") or server_name,
+            "serverId": sid,
+            "characterId": cid,
+            "className": info.get("job") or "",
+            "combatPower": int(info.get("combatPower") or 0),
+            "characterLevel": int(info.get("level") or 0),
+            "officialUrl": info.get("officialUrl") or "",
+        }
+        try:
+            detail = await _official_get_json_live(
+                OFFICIAL_CHARACTER_INFO_API,
+                params={"lang": "ko", "characterId": cid, "serverId": sid},
+                timeout=httpx.Timeout(connect=1.2, read=2.4, write=1.2, pool=1.2),
+            )
+            fresh = _official_info_from_live_data(row, detail)
+            if str(fresh.get("name") or "").casefold() == nickname.casefold():
+                info = _merge_card_info(info, fresh)
+                try:
+                    await character_db_upsert(info, character_id=cid, source="plaync-official")
+                except Exception:
+                    pass
+                return info
+        except Exception:
+            pass
+
+    # If the first hit saved identity without a characterId, do one server-specific
+    # official search.  This is still a basic lookup, not the expensive equipment path.
+    try:
+        resolved = await asyncio.wait_for(
+            _fresh_official_character(nickname, server_name), timeout=3.0
+        )
+        if isinstance(resolved, dict) and resolved.get("type") == "detail":
+            row = resolved.get("row") or {}
+            fresh = resolved.get("info") or {}
+            info = _merge_card_info(info, fresh)
+            cid = row_character_id(row) or str(info.get("characterId") or "")
+            if cid:
+                info["characterId"] = cid
+            try:
+                await character_db_upsert(info, character_id=cid, source="plaync-official")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return info
+
+
+async def character_card_data_fast(nickname: str, server_name: str):
+    """Fast OG-card snapshot with basic-info repair for identity-only first hits."""
+    nickname = str(nickname or "").strip()
+    server_name = resolve_server_alias(server_name) or str(server_name or "").strip()
     if not nickname or server_name not in SERVER_ID_MAP:
         return None
 
     info = None
     stones = []
+    saved_compare = None
+    saved_profile = None
 
-    # The direct chat lookup saves current official basic info before returning
-    # the card URL, so this normally resolves from the persistent DB immediately.
     try:
         rows = await character_db_get(nickname, server_name)
         if rows:
@@ -11840,52 +11953,58 @@ async def character_card_data_fast(nickname: str, server_name: str):
     except Exception:
         info = None
 
-    # Reuse the last successful official compare stone totals when available.
-    # This keeps OG rendering deterministic and fast; detail/compare endpoints
-    # continue to do their own live refresh.
+    # A successful compare snapshot is official NC data and is a safe local
+    # fallback for CP/job when the identity row was created during a cold hit.
     try:
-        saved = await character_db_get_official_compare(
+        saved_compare = await character_db_get_official_compare(
             nickname, server_name, max_age_seconds=None
         )
-        for row in (saved or {}).get("magicStoneTotals") or []:
+        saved_info = (saved_compare or {}).get("info") or {}
+        if saved_info:
+            info = _merge_card_info(info, saved_info)
+        for row in (saved_compare or {}).get("magicStoneTotals") or []:
             if not isinstance(row, dict):
                 continue
             name = str(row.get("name") or "").strip()
             if not name:
                 continue
-            total = row.get("total")
             try:
-                total = float(total or 0)
+                total = float(row.get("total") or 0)
             except Exception:
                 continue
             pct = any(x in name for x in ("증폭", "피해", "강타", "완벽"))
-            suffix = "%" if pct else ""
-            stones.append((name, "+" + pretty_number(total) + suffix))
+            stones.append((name, "+" + pretty_number(total) + ("%" if pct else "")))
     except Exception:
         pass
 
-    # If compare has never been opened, use the detailed profile already saved
-    # by the normal character lookup. This is a local DB read only, so the card
-    # still renders immediately while showing the mounted magic-stone total.
-    if not stones:
-        try:
-            _, saved_profile = await character_db_get_full_profile(
-                nickname, server_name
+    # Saved full profile can also repair CP/job locally before any network call.
+    try:
+        _, saved_profile = await character_db_get_full_profile(nickname, server_name)
+        if saved_profile:
+            profile_basic = profile_info(
+                saved_profile,
+                nickname,
+                server_name,
+                {
+                    "name": nickname,
+                    "serverName": server_name,
+                    "serverId": SERVER_ID_MAP.get(server_name),
+                    "characterId": (info or {}).get("characterId") or "",
+                },
             )
-            if saved_profile:
+            info = _merge_card_info(info, profile_basic)
+            if not stones:
                 stones = aggregate_magic_stones(saved_profile)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-    # If the DB is empty (direct URL / first-ever hit), allow only a short basic
-    # resolver attempt. Card rendering must not time out into a bare Kakao URL.
-    if not info:
+    # Critical fix: an existing DB row is NOT automatically considered complete.
+    # Identity-only rows have CP=0/job blank. Refresh those before rendering.
+    if not info or _card_info_incomplete(info):
         try:
-            resolved = await asyncio.wait_for(
-                own_resolve_character(nickname, server_name), timeout=2.8
+            info = await asyncio.wait_for(
+                _refresh_card_basic_info(nickname, server_name, info), timeout=2.75
             )
-            if isinstance(resolved, dict) and resolved.get("type") == "detail":
-                info = dict(resolved.get("info") or {})
         except Exception:
             pass
 
@@ -11895,7 +12014,7 @@ async def character_card_data_fast(nickname: str, server_name: str):
             "server": server_name,
             "serverId": int(SERVER_ID_MAP.get(server_name) or 0),
             "characterId": "",
-            "job": "AION2 캐릭터",
+            "job": "정보 갱신 중",
             "combatPower": 0,
             "level": 0,
             "profileImage": "",
@@ -11903,12 +12022,42 @@ async def character_card_data_fast(nickname: str, server_name: str):
 
     info.setdefault("name", nickname)
     info.setdefault("server", server_name)
-    info.setdefault("job", "AION2 캐릭터")
-    info.setdefault("combatPower", 0)
+    if str(info.get("job") or "").strip() in ("", "확인 실패", "AION2 캐릭터"):
+        info["job"] = "정보 갱신 중"
+    try:
+        info["combatPower"] = int(info.get("combatPower") or 0)
+    except Exception:
+        info["combatPower"] = 0
     info.setdefault("profileImage", "")
     return {"info": info, "stones": stones}
 
 
+@app.get("/api/card-basic")
+async def character_card_basic_latest(name: str = "", server: str = ""):
+    """Client-side repair endpoint for a cold card whose first render had CP=0."""
+    nickname = str(name or "").strip()
+    server_name = resolve_server_alias(server) or str(server or "").strip()
+    if not nickname or server_name not in SERVER_ID_MAP:
+        return {"ok": False, "info": {}}
+
+    seed = None
+    try:
+        rows = await character_db_get(nickname, server_name)
+        if rows:
+            seed = dict(rows[0])
+    except Exception:
+        pass
+
+    try:
+        info = await asyncio.wait_for(
+            _refresh_card_basic_info(nickname, server_name, seed), timeout=3.4
+        )
+    except Exception:
+        info = seed or {}
+
+    if not info or _card_info_incomplete(info):
+        return {"ok": False, "info": info or {}}
+    return {"ok": True, "info": info}
 
 
 @app.get("/api/card-stones")
@@ -12019,11 +12168,11 @@ body{{margin:0;background:#0c1018;color:#f5f7fb;font-family:-apple-system,BlinkM
 <div class="wrap"><div class="card">
   <div class="cardtop"><a class="detailbtn" href="{detail_url}">상세보기</a></div>
   <div class="hero">
-    <img class="avatar" src="{profile_image}" alt="">
+    <img id="profileImage" class="avatar" src="{profile_image}" alt="">
     <div>
-      <div class="name">{escape(info['name'])}</div>
-      <div class="meta">{escape(info['server'])} · {escape(info['job'])}</div>
-      <div class="cp">전투력 {cp_short}</div>
+      <div id="characterName" class="name">{escape(info['name'])}</div>
+      <div class="meta"><span id="serverText">{escape(info['server'])}</span> · <span id="jobText">{escape(info['job'])}</span></div>
+      <div id="combatPowerText" class="cp">전투력 {cp_short}</div>
       <div class="badge">AION2 CHARACTER</div>
     </div>
   </div>
@@ -12047,6 +12196,35 @@ body{{margin:0;background:#0c1018;color:#f5f7fb;font-family:-apple-system,BlinkM
       .replace(/>/g,"&gt;")
       .replace(/\"/g,"&quot;");
   }}
+  function applyBasic(d){{
+    if(!d || d.ok!==true || !d.info) return false;
+    var i=d.info||{{}};
+    var cp=Number(i.combatPower||0);
+    var n=document.getElementById("characterName");
+    var s=document.getElementById("serverText");
+    var j=document.getElementById("jobText");
+    var c=document.getElementById("combatPowerText");
+    var img=document.getElementById("profileImage");
+    if(n && i.name) n.textContent=i.name;
+    if(s && i.server) s.textContent=i.server;
+    if(j && i.job) j.textContent=i.job;
+    if(c && cp>0) c.textContent="전투력 "+Math.round(cp/1000);
+    if(img && i.profileImage) img.src=i.profileImage;
+    return cp>0;
+  }}
+  function refreshBasic(attempt){{
+    fetch("/api/card-basic?name="+encodeURIComponent(name)+"&server="+encodeURIComponent(server)+"&_="+Date.now(),{{cache:"no-store"}})
+      .then(function(r){{return r.json();}})
+      .then(function(d){{
+        if(applyBasic(d)) return;
+        if(attempt<2) setTimeout(function(){{refreshBasic(attempt+1);}}, attempt===0?650:1400);
+      }})
+      .catch(function(){{
+        if(attempt<2) setTimeout(function(){{refreshBasic(attempt+1);}}, attempt===0?650:1400);
+      }});
+  }}
+  refreshBasic(0);
+
   fetch("/api/card-stones?name="+encodeURIComponent(name)+"&server="+encodeURIComponent(server),{{cache:"no-store"}})
     .then(function(r){{return r.json();}})
     .then(function(d){{
