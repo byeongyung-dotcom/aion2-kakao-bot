@@ -341,7 +341,11 @@ async def search_characters_all_servers(nickname: str):
             row_server_id(row) or 999999,
         )
     )
-    cache_set(cache_key, exact)
+    # Empty search results are often transient on the upstream search service.
+    # Never cache a negative hit: a first request that races a cold/search index
+    # must not poison the next request for 180 seconds.
+    if exact:
+        cache_set(cache_key, exact)
     return exact
 
 async def get_profile(server_id: int, character_id: str, fast=False):
@@ -645,36 +649,56 @@ SERVER_NAMES = tuple(SERVER_ID_MAP.keys())
 
 # Character-search server aliases.
 #
-# The chat command accepts a server before OR after a nickname.  Players also
-# commonly shorten long server names, so create conservative aliases from the
-# official server list instead of hard-coding nicknames:
-#   나니아   -> 나니      (two-syllable prefix)
-#   마르쿠탄 -> 마르 / 마탄 (prefix / first+last)
-# A generated alias is used only when it identifies exactly one server.
-# Ambiguous abbreviations are intentionally ignored to prevent a character name
-# from being cut at the wrong position.
+# Full server names remain authoritative.  Short forms are accepted only when
+# they map to exactly one official server.  We generate conservative prefix and
+# compressed-edge forms (e.g. 나니아 -> 나니, 마르쿠탄 -> 마탄/마르탄) and
+# add a tiny set of common community aliases.  A short alias is never allowed to
+# irreversibly cut a nickname: smart lookup validates the split and can fall
+# back to the whole nickname.
 def _server_alias_norm(value):
     return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
+SERVER_ALIAS_MANUAL = {
+    # Common/requested shorthand.  Short aliases are validated by a real
+    # character lookup before they are accepted, so odd nicknames stay safe.
+    "말쿠": "마르쿠탄",
+    "마쿠": "마르쿠탄",
+    "마스": "마르쿠탄",
+}
+
+
 def _build_server_alias_maps():
     candidates = defaultdict(set)
+
+    def add(alias, server):
+        alias = _server_alias_norm(alias)
+        if len(alias) < 2 or alias == _server_alias_norm(server):
+            return
+        candidates[alias].add(server)
 
     for server in SERVER_NAMES:
         name = str(server or "").strip()
         if not name:
             continue
 
-        # Natural prefixes: 2 chars up to one char before the full name.
-        # This covers 나니아 -> 나니, 마르쿠탄 -> 마르/마르쿠, etc.
+        # Natural prefixes: 나니아 -> 나니, 마르쿠탄 -> 마르 / 마르쿠.
         for size in range(2, len(name)):
-            candidates[_server_alias_norm(name[:size])].add(name)
+            add(name[:size], name)
 
-        # Compact edge alias: remove the middle characters.
-        # Example pattern: 마르쿠스 -> 마스.  For the actual server
-        # 마르쿠탄 this becomes 마탄.
-        if len(name) >= 3:
-            candidates[_server_alias_norm(name[0] + name[-1])].add(name)
+        # Compressed middle: keep a non-empty prefix and suffix while deleting
+        # at least one middle character.  This is the general "가운데 글자 제외"
+        # pattern.  Examples: 마르쿠탄 -> 마탄 / 마르탄, 나니아 -> 나아.
+        n = len(name)
+        for left in range(1, n):
+            for right in range(1, n - left + 1):
+                if left + right >= n:
+                    continue
+                add(name[:left] + name[n-right:], name)
+
+    for alias, server in SERVER_ALIAS_MANUAL.items():
+        if server in SERVER_ID_MAP:
+            add(alias, server)
 
     unique = {}
     ambiguous = set()
@@ -705,11 +729,10 @@ def resolve_server_alias(value):
 
 
 def _server_parse_tokens(include_aliases=True):
-    """Build prefix/suffix tokens ordered by confidence and token length."""
+    """Build prefix/suffix tokens ordered by confidence then token length."""
     rows = []
     seen = set()
 
-    # Full server names always have highest confidence.
     for server in SERVER_NAMES:
         token = str(server)
         key = (_server_alias_norm(token), server)
@@ -719,9 +742,6 @@ def _server_parse_tokens(include_aliases=True):
 
     if include_aliases:
         for alias_key, server in SERVER_ALIAS_MAP.items():
-            # alias_key is normalized Korean text for our generated aliases.
-            # It is safe to use as the slicing token because aliases contain no
-            # spaces or punctuation.
             key = (alias_key, server)
             if key in seen:
                 continue
@@ -1488,7 +1508,8 @@ async def _fresh_official_character(nickname, server_name=None):
 
 
 async def own_resolve_character(nickname, server_name=None):
-    """Direct lookup: NC official live data first, DB only as last fallback."""
+    """Direct lookup with one bounded retry for transient first-hit misses."""
+    resolve_started = time.monotonic()
     nickname = str(nickname or "").strip()
     raw_server_name = str(server_name or "").strip()
     server_name = (resolve_server_alias(raw_server_name) or raw_server_name) if raw_server_name else None
@@ -1584,7 +1605,26 @@ async def own_resolve_character(nickname, server_name=None):
     except Exception:
         pass
 
-    # 3) Last saved value only if both live sources fail.
+    # 3) First-hit transient retry.  NC/NotMeter occasionally returns a clean
+    # zero-row response on the first cold request and succeeds immediately on the
+    # second.  Retry *inside the same user request* when there is still budget, so
+    # the user never has to type the same character twice.
+    elapsed = time.monotonic() - resolve_started
+    if elapsed < 5.5:
+        try:
+            await asyncio.sleep(0.12)
+            retry_timeout = 2.4 if server_name else 2.0
+            official_retry = await asyncio.wait_for(
+                _fresh_official_character(nickname, server_name),
+                timeout=retry_timeout,
+            )
+            if official_retry:
+                await _save_notmeter_resolved(official_retry)
+                return official_retry
+        except Exception:
+            pass
+
+    # 4) Last saved value only if all live attempts fail.
     db_infos = await character_db_get(nickname, server_name)
     return _db_resolved_from_infos(db_infos)
 
@@ -2058,7 +2098,10 @@ async def official_search_characters(nickname, server_name=None):
         )
     )
 
-    cache_set(cache_key, rows)
+    # Same rule for NC official search: cache successes only.  A zero-row
+    # response can be a transient cold/rate-limit/search-index result.
+    if rows:
+        cache_set(cache_key, rows)
     return rows
 
 
@@ -2255,13 +2298,7 @@ async def official_character_lookup_smart(body):
 
 
 def split_server_and_nickname_candidates(text: str, include_aliases=True):
-    """Return every plausible (nickname, canonical_server, exact_server) split.
-
-    Full server names are returned first, followed by unique abbreviations.
-    Both prefix and suffix forms are accepted.  Returning candidates instead of
-    one irreversible split is important for unusual nicknames that themselves
-    begin/end with a server-like string.
-    """
+    """Return plausible (nickname, canonical_server, exact_server, token) splits."""
     text = str(text or "").strip()
     if not text:
         return []
@@ -2275,14 +2312,11 @@ def split_server_and_nickname_candidates(text: str, include_aliases=True):
 
         if folded.startswith(tf) and len(text) > len(token):
             nickname = text[len(token):].strip()
-            # A two-syllable alias such as 나니 must not split the nickname
-            # 나니아 into server=나니아 + nickname=아.  Generated aliases
-            # therefore require at least a two-character nickname remainder.
             if nickname and (is_exact or len(nickname) >= 2):
                 key = (nickname.casefold(), server)
                 if key not in seen:
                     seen.add(key)
-                    out.append((nickname, server, is_exact))
+                    out.append((nickname, server, is_exact, token))
 
         if folded.endswith(tf) and len(text) > len(token):
             nickname = text[:-len(token)].strip()
@@ -2290,7 +2324,7 @@ def split_server_and_nickname_candidates(text: str, include_aliases=True):
                 key = (nickname.casefold(), server)
                 if key not in seen:
                     seen.add(key)
-                    out.append((nickname, server, is_exact))
+                    out.append((nickname, server, is_exact, token))
 
     return out
 
@@ -2300,38 +2334,79 @@ def split_server_and_nickname(text: str):
     candidates = split_server_and_nickname_candidates(text, include_aliases=True)
     if not candidates:
         return None
-    nickname, server, _ = candidates[0]
+    nickname, server, _is_exact, _token = candidates[0]
     return nickname, server
 
 
+def _explicit_spaced_server_split(text: str):
+    """Recognize an intentionally separated server token at either edge."""
+    parts = [p for p in re.split(r"\s+", str(text or "").strip()) if p]
+    if len(parts) < 2:
+        return None
+
+    first_server = resolve_server_alias(parts[0])
+    if first_server:
+        nickname = " ".join(parts[1:]).strip()
+        if nickname:
+            return nickname, first_server
+
+    last_server = resolve_server_alias(parts[-1])
+    if last_server:
+        nickname = " ".join(parts[:-1]).strip()
+        if nickname:
+            return nickname, last_server
+
+    return None
+
+
 async def _resolve_character_query_smart(body, resolver):
-    """Resolve server-before/server-after input without destroying odd nicknames.
+    """Resolve server-before/server-after text on the FIRST request.
 
-    Order:
-    1) explicit nickname[server/alias]
-    2) full server-name prefix/suffix candidates
-    3) unique abbreviation prefix/suffix candidates
-    4) original whole text as a nickname fallback
+    The previous alias protection did a full all-server network lookup *before*
+    trying a short server alias.  On a cold first request that could spend up to
+    ~7.5 seconds on the wrong interpretation, then start the real alias lookup.
+    The outer chat timeout could finish first; the second request then worked
+    because caches/DB were warm.
 
-    Crucially, a failed server split never ends the search.  The original text is
-    retried as the nickname, which fixes names that happen to start/end with a
-    server name or server abbreviation.
+    New order:
+      1) explicit [server] / spaced server form
+      2) attached full server name
+      3) if a short alias exists, protect already-known literal nicknames from DB
+      4) try the server-specific alias immediately (fast / deterministic)
+      5) only then do the expensive whole-text all-server fallback
+
+    Thus 나니닉 / 닉나니 / 마스닉 / 닉마스 do not need a warm-up request,
+    while an unusual literal nickname already known to our DB is never cut.
     """
     body = str(body or "").strip()
-    nickname, explicit_server = parse_character_query(body)
+    if not body:
+        return body, None, {"type": "none"}
 
+    nickname, explicit_server = parse_character_query(body)
     if explicit_server:
         canonical = resolve_server_alias(explicit_server) or explicit_server
         resolved = await resolver(nickname, canonical)
-        return nickname, canonical, resolved
+        if isinstance(resolved, dict) and resolved.get("type") != "none":
+            return nickname, canonical, resolved
+        # Explicit form failed: literal nickname fallback once.
+        whole = await resolver(body, None)
+        return body, None, whole
+
+    spaced = _explicit_spaced_server_split(body)
+    if spaced:
+        nickname, server_name = spaced
+        resolved = await resolver(nickname, server_name)
+        if isinstance(resolved, dict) and resolved.get("type") != "none":
+            return nickname, server_name, resolved
+        whole = await resolver(body, None)
+        return body, None, whole
 
     candidates = split_server_and_nickname_candidates(body, include_aliases=True)
+    exact = [c for c in candidates if c[2]]
+    aliases = [c for c in candidates if not c[2]]
 
-    # Full names before abbreviations; _server_parse_tokens already preserves
-    # that ordering, but keep the sort explicit for future edits.
-    candidates.sort(key=lambda x: (0 if x[2] else 1, -len(x[1]), x[1]))
-
-    for candidate_nickname, server_name, _is_exact in candidates[:6]:
+    # Full canonical server names are strong intent; try them first.
+    for candidate_nickname, server_name, _is_exact, _token in exact:
         try:
             resolved = await resolver(candidate_nickname, server_name)
         except Exception:
@@ -2339,7 +2414,29 @@ async def _resolve_character_query_smart(body, resolver):
         if isinstance(resolved, dict) and resolved.get("type") != "none":
             return candidate_nickname, server_name, resolved
 
-    # Do not let a false prefix/suffix split break a special nickname.
+    if aliases:
+        # Fast local protection for special nicknames.  Do NOT spend a full live
+        # all-server request here; that serial warm-up was the first-hit bug.
+        try:
+            db_infos = await character_db_get(body, None)
+            db_resolved = _db_resolved_from_infos(db_infos)
+            if isinstance(db_resolved, dict) and db_resolved.get("type") != "none":
+                return body, None, db_resolved
+        except Exception:
+            pass
+
+        # Prefer the most specific alias.  Usually there is only one candidate,
+        # but keep all unique candidates for unusual names.
+        aliases.sort(key=lambda x: (-len(x[3]), x[1], x[0]))
+        for candidate_nickname, server_name, _is_exact, _token in aliases:
+            try:
+                resolved = await resolver(candidate_nickname, server_name)
+            except Exception:
+                continue
+            if isinstance(resolved, dict) and resolved.get("type") != "none":
+                return candidate_nickname, server_name, resolved
+
+    # Nothing server-shaped resolved: literal whole-name lookup is the final path.
     resolved = await resolver(body, None)
     return body, None, resolved
 
@@ -6829,7 +6926,7 @@ BOSS_RULES_META = {
     "sources": {},
 }
 
-AGRO_FALLBACK_ANCHOR = datetime(2026, 9, 2, 6, 0, tzinfo=KST)
+AGRO_FALLBACK_ANCHOR = datetime(2026, 9, 9, 10, 0, tzinfo=KST)
 
 _boss_rule_refresh = {
     "ts": 0.0,
@@ -7955,6 +8052,10 @@ def _manual_agro_anchor_for_source(source_id=None, official_anchor=None):
         return manual
     if stored_source and stored_source != current_source:
         return None
+    # Legacy/unbound manual anchors must not override a confirmed official
+    # maintenance source forever. New manual corrections always save sourceId.
+    if not stored_source:
+        return None
     return manual
 
 
@@ -8133,43 +8234,39 @@ async def _fetch_inven_current_maintenance_candidate(persisted_anchor=None, pers
     if not parsed_rows:
         return None
 
-    # 1) If the persisted anchor is still recent (same maintenance cycle), prefer
-    # that calendar day.  2) Otherwise discover the most recent/current
-    # maintenance independently of persisted state. This fixes both empty state
-    # after deploy and a previous-week anchor such as 9/2 while today is 9/9.
-    pool = []
-    if persisted_anchor is not None:
-        age_hours = abs((now - persisted_anchor).total_seconds()) / 3600.0
-        if age_hours <= 36:
-            pool = [
-                r for r in parsed_rows
-                if r.get("start") is not None
-                and r["start"].date() == persisted_anchor.date()
-            ]
-
-    if not pool:
-        recent_cutoff = now - timedelta(hours=48)
-        future_cutoff = now + timedelta(hours=12)
-        pool = [
-            r for r in parsed_rows
-            if r.get("start") is not None
-            and recent_cutoff <= r["start"] <= future_cutoff
-        ]
+    # Bootstrap/redeploy recovery: always consider the most recent actual game
+    # maintenance that has already STARTED.  Do not depend on persisted state and
+    # do not adopt a future announced maintenance before it begins.  A 14-day
+    # window survives Render state loss several days after the last weekly patch.
+    recent_cutoff = now - timedelta(days=14)
+    started_cutoff = now + timedelta(minutes=5)
+    pool = [
+        r for r in parsed_rows
+        if r.get("start") is not None
+        and recent_cutoff <= r["start"] <= started_cutoff
+    ]
 
     if not pool:
         return None
 
-    # Explicit extension/completion titles are stronger than a plain schedule
-    # title. For plain schedule duplicates (e.g. stale 09:30 and revised 10:00),
-    # choose the later end on the most recent maintenance day.
-    newest_day = max(r["start"].date() for r in pool if r.get("start") is not None)
-    pool = [r for r in pool if r.get("start") is not None and r["start"].date() == newest_day]
+    # Never let mirror data roll a newer persisted maintenance back to an older
+    # calendar day.
+    if persisted_anchor is not None:
+        pool = [r for r in pool if r["start"].date() >= persisted_anchor.date()]
+        if not pool:
+            return None
+
+    newest_day = max(r["start"].date() for r in pool)
+    pool = [r for r in pool if r["start"].date() == newest_day]
 
     definitive = [r for r in pool if r.get("kind") in ("extension", "early_end", "completion")]
     if definitive:
-        best = definitive[0]
+        # If multiple definite rows exist on the same day, use the latest/largest
+        # effective end unless an early completion explicitly moves it earlier.
+        early = [r for r in definitive if r.get("kind") in ("early_end", "completion")]
+        best = early[0] if early else max(definitive, key=lambda r: r.get("end") or datetime.min.replace(tzinfo=KST))
     else:
-        best = max(pool, key=lambda r: (r.get("end") or datetime.min.replace(tzinfo=KST)))
+        best = max(pool, key=lambda r: r.get("end") or datetime.min.replace(tzinfo=KST))
 
     source_id = str(persisted_source or "")
     return {
@@ -8340,6 +8437,11 @@ async def latest_maintenance_anchor():
                 if c["kind"] != "schedule":
                     continue
                 end_dt = c["end"]
+                start_dt = c.get("start")
+                # A maintenance announcement posted in advance must not move the
+                # Agro cycle before the maintenance actually begins.
+                if start_dt is not None and start_dt > now + timedelta(minutes=5):
+                    continue
                 if persisted_anchor is not None and end_dt <= persisted_anchor:
                     continue
                 chosen = c
