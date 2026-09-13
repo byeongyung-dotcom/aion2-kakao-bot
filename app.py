@@ -1385,14 +1385,17 @@ def _official_info_from_live_data(row, data):
 
 
 async def _fresh_official_character(nickname, server_name=None):
-    """Fast, uncached NC lookup used by direct character commands."""
+    """Fast uncached NC lookup.
+
+    A confirmed exact search row is enough to establish character identity.
+    The detail endpoint is enrichment only: a transient detail failure must never
+    turn an exact search hit into "character not found" on the first request.
+    """
     nickname = str(nickname or "").strip()
     server_name = str(server_name or "").strip() or None
     if not nickname:
         return None
 
-    # Server-specific commands are the common path. Do exactly two live calls:
-    # search once, detail once. No 120/180-second application cache is used.
     if server_name:
         sid = SERVER_ID_MAP.get(server_name)
         if not sid:
@@ -1406,6 +1409,7 @@ async def _fresh_official_character(nickname, server_name=None):
                     "race": _official_server_race(sid),
                     "serverId": int(sid),
                 },
+                timeout=httpx.Timeout(connect=1.6, read=3.8, write=1.6, pool=1.6),
             )
         except Exception:
             return None
@@ -1417,31 +1421,23 @@ async def _fresh_official_character(nickname, server_name=None):
                 item_sid = int(item.get("serverId") or sid)
             except Exception:
                 continue
-            if (
-                item_name.casefold() != nickname.casefold()
-                or item_sid != int(sid)
-            ):
+            if item_name.casefold() != nickname.casefold() or item_sid != int(sid):
                 continue
-            cid = unquote(
-                str(
-                    item.get("characterId")
-                    or item.get("charId")
-                    or item.get("id")
-                    or ""
-                ).strip()
-            )
+            cid = unquote(str(
+                item.get("characterId")
+                or item.get("charId")
+                or item.get("id")
+                or ""
+            ).strip())
             if not cid:
                 continue
             row = {
                 "name": item_name,
-                "serverName": _strip_html(item.get("serverName"))
-                or server_name,
+                "serverName": _strip_html(item.get("serverName")) or server_name,
                 "serverId": item_sid,
-                "className": _strip_html(item.get("className"))
-                or _strip_html(item.get("jobName")),
-                "characterLevel": int(
-                    item.get("characterLevel") or item.get("level") or 0
-                ),
+                "className": _strip_html(item.get("className")) or _strip_html(item.get("jobName")),
+                "combatPower": int(item.get("combatPower") or 0),
+                "characterLevel": int(item.get("characterLevel") or item.get("level") or 0),
                 "characterId": cid,
                 "officialUrl": (
                     f"{OFFICIAL_CHARACTER_BASE}/ko-kr/characters/"
@@ -1453,6 +1449,12 @@ async def _fresh_official_character(nickname, server_name=None):
         if not row:
             return None
 
+        # Detail is enrichment, not identity validation.  NC occasionally returns
+        # an empty/slow detail response on the first cold hit while the search row
+        # is already correct.  In that case return the exact search row now.
+        info = profile_info({}, nickname, server_name, row)
+        info["characterId"] = str(row.get("characterId") or "")
+        info["officialUrl"] = str(row.get("officialUrl") or "")
         try:
             detail = await _official_get_json_live(
                 OFFICIAL_CHARACTER_INFO_API,
@@ -1461,13 +1463,13 @@ async def _fresh_official_character(nickname, server_name=None):
                     "characterId": row["characterId"],
                     "serverId": int(row["serverId"]),
                 },
+                timeout=httpx.Timeout(connect=1.6, read=3.8, write=1.6, pool=1.6),
             )
-            info = _official_info_from_live_data(row, detail)
+            enriched = _official_info_from_live_data(row, detail)
+            if str(enriched.get("name") or "").casefold() == nickname.casefold():
+                info = enriched
         except Exception:
-            return None
-
-        if str(info.get("name") or "").casefold() != nickname.casefold():
-            return None
+            pass
 
         return {
             "type": "detail",
@@ -1493,10 +1495,7 @@ async def _fresh_official_character(nickname, server_name=None):
             valid.append((row, info))
     if not valid:
         return None
-    valid.sort(
-        key=lambda x: int(x[1].get("combatPower") or 0),
-        reverse=True,
-    )
+    valid.sort(key=lambda x: int(x[1].get("combatPower") or 0), reverse=True)
     row, info = valid[0]
     return {
         "type": "detail",
@@ -1508,27 +1507,29 @@ async def _fresh_official_character(nickname, server_name=None):
 
 
 async def own_resolve_character(nickname, server_name=None):
-    """Direct lookup with one bounded retry for transient first-hit misses."""
+    """Resolve one character without requiring a second user request.
+
+    Server-specific lookups use independent identity paths.  Once any source has
+    confirmed the exact nickname + server, detail/enrichment failures no longer
+    downgrade that identity to "none".
+    """
     resolve_started = time.monotonic()
     nickname = str(nickname or "").strip()
     raw_server_name = str(server_name or "").strip()
     server_name = (resolve_server_alias(raw_server_name) or raw_server_name) if raw_server_name else None
 
-    # Fastest/latest path for a server-specific lookup: if we already know the
-    # official characterId, skip the search API and fetch live character info
-    # directly. This avoids stale search results and cuts the normal request to
-    # one official NC call.
+    if not nickname:
+        return {"type": "none"}
+
+    # 0) Persistent exact identity first.  If the DB knows the characterId, a
+    # temporary NC detail outage must not make the character disappear.
     if server_name:
         sid = SERVER_ID_MAP.get(server_name)
         if sid:
             try:
                 db_rows = await character_db_get(nickname, server_name)
                 for db_row in (db_rows or []):
-                    cid = str(
-                        db_row.get("characterId")
-                        or db_row.get("character_id")
-                        or ""
-                    ).strip()
+                    cid = str(db_row.get("characterId") or db_row.get("character_id") or "").strip()
                     if not cid:
                         continue
                     row = {
@@ -1541,50 +1542,40 @@ async def own_resolve_character(nickname, server_name=None):
                         ),
                         "serverId": int(sid),
                         "characterId": cid,
-                        "className": str(
-                            db_row.get("job")
-                            or db_row.get("className")
-                            or ""
-                        ),
-                        "characterLevel": int(
-                            db_row.get("level")
-                            or db_row.get("characterLevel")
-                            or 0
-                        ),
+                        "className": str(db_row.get("job") or db_row.get("className") or ""),
+                        "combatPower": int(db_row.get("combatPower") or db_row.get("combat_power") or 0),
+                        "characterLevel": int(db_row.get("level") or db_row.get("characterLevel") or 0),
                     }
-                    detail = await _official_get_json_live(
-                        OFFICIAL_CHARACTER_INFO_API,
-                        params={
-                            "lang": "ko",
-                            "characterId": cid,
-                            "serverId": int(sid),
-                        },
-                        timeout=httpx.Timeout(
-                            connect=1.8, read=3.5, write=1.8, pool=1.8
-                        ),
-                    )
-                    info = _official_info_from_live_data(row, detail)
-                    if (
-                        str(info.get("name") or "").casefold()
-                        == nickname.casefold()
-                    ):
-                        resolved = {
-                            "type": "detail",
-                            "row": row,
-                            "profile": {},
-                            "info": info,
-                            "stones": [],
-                        }
-                        await _save_notmeter_resolved(resolved)
-                        return resolved
+                    # Start with the saved identity; enrich if NC answers quickly.
+                    info = profile_info({}, nickname, server_name, row)
+                    info["characterId"] = cid
+                    try:
+                        detail = await _official_get_json_live(
+                            OFFICIAL_CHARACTER_INFO_API,
+                            params={"lang": "ko", "characterId": cid, "serverId": int(sid)},
+                            timeout=httpx.Timeout(connect=1.2, read=2.4, write=1.2, pool=1.2),
+                        )
+                        enriched = _official_info_from_live_data(row, detail)
+                        if str(enriched.get("name") or "").casefold() == nickname.casefold():
+                            info = enriched
+                    except Exception:
+                        pass
+                    return {
+                        "type": "detail",
+                        "row": row,
+                        "profile": {},
+                        "info": info,
+                        "stones": [],
+                    }
             except Exception:
                 pass
 
-    # 1) Official NC source, with character caches explicitly cleared.
+    # 1) NC official exact search.  _fresh_official_character now treats the
+    # exact search row as identity even when the detail endpoint is cold.
     try:
         official = await asyncio.wait_for(
             _fresh_official_character(nickname, server_name),
-            timeout=5.0,
+            timeout=5.2,
         )
         if official:
             await _save_notmeter_resolved(official)
@@ -1592,28 +1583,54 @@ async def own_resolve_character(nickname, server_name=None):
     except Exception:
         pass
 
-    # 2) Existing notmeter route, also bypass its 180s search cache.
-    _cache.pop(f"char-search:{nickname.casefold()}", None)
-    try:
-        fresh = await asyncio.wait_for(
-            resolve_character(nickname, server_name),
-            timeout=2.5,
-        )
-        if fresh and fresh.get("type") != "none":
-            await _save_notmeter_resolved(fresh)
-            return fresh
-    except Exception:
-        pass
-
-    # 3) First-hit transient retry.  NC/NotMeter occasionally returns a clean
-    # zero-row response on the first cold request and succeeds immediately on the
-    # second.  Retry *inside the same user request* when there is still budget, so
-    # the user never has to type the same character twice.
-    elapsed = time.monotonic() - resolve_started
-    if elapsed < 5.5:
+    # 2) For an explicit server, use NotMeter's SERVER-SPECIFIC search endpoint.
+    # The old code used all-server search here, which is exactly the path that can
+    # return zero on a first cold hit and then work on the second request.
+    if server_name and server_name in SERVER_ID_MAP:
         try:
-            await asyncio.sleep(0.12)
-            retry_timeout = 2.4 if server_name else 2.0
+            matched = await asyncio.wait_for(
+                search_character_on_server(nickname, server_name),
+                timeout=3.6,
+            )
+            if matched:
+                matched = sorted(
+                    matched,
+                    key=lambda row: int(row.get("combatPower") or 0),
+                    reverse=True,
+                )
+                row = matched[0]
+                try:
+                    detail = await asyncio.wait_for(load_detail(row, nickname), timeout=2.8)
+                except Exception:
+                    detail = {
+                        "row": row,
+                        "profile": {},
+                        "info": profile_info({}, nickname, server_name, row),
+                        "stones": [],
+                    }
+                resolved = {"type": "detail", **detail}
+                await _save_notmeter_resolved(resolved)
+                return resolved
+        except Exception:
+            pass
+    else:
+        # Server-less lookup keeps the existing all-server NotMeter fallback.
+        _cache.pop(f"char-search:{nickname.casefold()}", None)
+        try:
+            fresh = await asyncio.wait_for(resolve_character(nickname, None), timeout=3.2)
+            if fresh and fresh.get("type") != "none":
+                await _save_notmeter_resolved(fresh)
+                return fresh
+        except Exception:
+            pass
+
+    # 3) One bounded in-request retry only when there is still time.  A user should
+    # never have to type the same command twice just to warm the upstream service.
+    elapsed = time.monotonic() - resolve_started
+    if elapsed < 8.2:
+        try:
+            await asyncio.sleep(0.45)
+            retry_timeout = 2.8 if server_name else 2.2
             official_retry = await asyncio.wait_for(
                 _fresh_official_character(nickname, server_name),
                 timeout=retry_timeout,
@@ -1624,7 +1641,7 @@ async def own_resolve_character(nickname, server_name=None):
         except Exception:
             pass
 
-    # 4) Last saved value only if all live attempts fail.
+    # 4) Last saved value only after all identity sources fail.
     db_infos = await character_db_get(nickname, server_name)
     return _db_resolved_from_infos(db_infos)
 
