@@ -6978,7 +6978,7 @@ _maintenance_anchor_cache = {
 }
 
 # Only Kaira and Nahma are fixed.  These schedules follow maintenance.
-MAINTENANCE_DYNAMIC_KEYS = ("abyss", "sigong", "gyunyeol", "ati", "fieldboss")
+MAINTENANCE_DYNAMIC_KEYS = ()  # Weekly contents/boss clocks are fixed; only Agro follows maintenance end.
 
 _WEEKDAY_KO = {
     "월": 0, "월요일": 0,
@@ -7892,11 +7892,22 @@ def _apply_manual_schedule_overrides():
     if isinstance(kaira.get("hours"), list) and kaira["hours"]:
         BOSS_RULES["kairaHours"] = sorted(set(int(x) % 24 for x in kaira["hours"]))
 
-    for key, prefix in (("nahma", "nahma"), ("abyss", "abyss")):
-        row = data.get(key) or {}
-        if "hour" in row and "minute" in row:
-            BOSS_RULES[prefix + "Hour"] = int(row["hour"])
-            BOSS_RULES[prefix + "Minute"] = int(row["minute"])
+    # Nahma is a fixed weekly schedule but existing explicit/manual corrections
+    # have always been stored directly and remain compatible.
+    nahma = data.get("nahma") or {}
+    if "hour" in nahma and "minute" in nahma:
+        BOSS_RULES["nahmaHour"] = int(nahma["hour"])
+        BOSS_RULES["nahmaMinute"] = int(nahma["minute"])
+
+    # IMPORTANT: Abyss/Sigong/Rift/Artifact/Field Boss are fixed published clocks.
+    # Older bot versions incorrectly wrote maintenance-shifted values into these
+    # buckets.  Ignore those legacy rows unless they were explicitly written by
+    # a user on the new policy (manual=True).  This automatically repairs stale
+    # 20:30/23:30-style values after a deploy without deleting the state file.
+    abyss = data.get("abyss") or {}
+    if abyss.get("manual") is True and "hour" in abyss and "minute" in abyss:
+        BOSS_RULES["abyssHour"] = int(abyss["hour"])
+        BOSS_RULES["abyssMinute"] = int(abyss["minute"])
 
     for key, rule_key in (
         ("sigong", "sigongTimes"),
@@ -7905,6 +7916,8 @@ def _apply_manual_schedule_overrides():
         ("fieldboss", "fieldBossTimes"),
     ):
         row = data.get(key) or {}
+        if row.get("manual") is not True:
+            continue
         times = row.get("times")
         if isinstance(times, list) and times:
             parsed = []
@@ -7989,82 +8002,37 @@ def _shift_clock(hour, minute, delta_minutes):
     return total // 60, total % 60
 
 def _bind_or_rebase_maintenance_schedules(old_anchor, new_anchor, source_id, source_title):
-    """Bind current dynamic schedules to the first maintenance source, then
-    shift them only when a genuinely newer maintenance source is accepted.
+    """Record maintenance binding without shifting fixed weekly schedules.
 
-    Kaira and Nahma are intentionally excluded.
+    Current published clocks are fixed by weekday/time:
+    - Sigong domination: Mon/Thu/Sat 20:00, 23:00
+    - Abyss Rift Zone: Tue/Thu 22:00
+    - Artifact occupation: Wed/Sat 22:00
+    - Abyss/field boss: Wed/Sat 22:30
+
+    Earlier bot versions incorrectly shifted these clocks whenever maintenance
+    ended later/earlier.  That made alerts fire at 20:30 instead of 20:00 after
+    a +30 minute maintenance change.  Only Agro uses the maintenance END as its
+    respawn anchor; fixed weekly clocks do not move with maintenance duration.
     """
     if new_anchor is None:
         return False
 
     data = _load_boss_schedule_overrides()
     meta = data.get("maintenanceDynamicMeta") if isinstance(data.get("maintenanceDynamicMeta"), dict) else {}
-    bound_anchor = _parse_kst_iso(meta.get("anchor"))
-    bound_source = str(meta.get("sourceId") or "")
+    previous = _parse_kst_iso(meta.get("anchor")) or old_anchor
     new_source = str(source_id or "")
-
-    # First binding/migration: preserve every current clock exactly as-is.
-    if bound_anchor is None:
-        data["maintenanceDynamicMeta"] = {
-            "anchor": new_anchor.astimezone(KST).isoformat(),
-            "sourceId": new_source,
-            "sourceTitle": str(source_title or ""),
-            "updatedAt": datetime.now(KST).isoformat(),
-        }
-        return _save_boss_schedule_overrides(data)
-
-    same_source = bool(new_source and bound_source and new_source == bound_source)
-    # Same article can be edited for extension/early completion. Accept a changed
-    # anchor for that same source. For a different source, never move backward.
-    if new_anchor == bound_anchor:
-        return True
-    if not same_source and new_anchor < bound_anchor:
-        return True
-
-    delta = _maintenance_clock_delta_minutes(bound_anchor, new_anchor)
-
-    # Abyss boss
-    row = data.get("abyss") if isinstance(data.get("abyss"), dict) else {}
-    ah = int(row.get("hour", BOSS_RULES.get("abyssHour", 22)))
-    am = int(row.get("minute", BOSS_RULES.get("abyssMinute", 30)))
-    ah, am = _shift_clock(ah, am, delta)
-    row.update({"hour": ah, "minute": am})
-    data["abyss"] = row
-
-    # Weekly maintenance-based contents / field boss.
-    for key, rule_key in (
-        ("sigong", "sigongTimes"),
-        ("gyunyeol", "gyunyeolTimes"),
-        ("ati", "atiTimes"),
-        ("fieldboss", "fieldBossTimes"),
-    ):
-        row = data.get(key) if isinstance(data.get(key), dict) else {}
-        times = row.get("times")
-        if not isinstance(times, list) or not times:
-            times = BOSS_RULES.get(rule_key) or []
-        shifted = []
-        for item in times:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                h, m = _shift_clock(item[0], item[1], delta)
-                shifted.append([h, m])
-        if shifted:
-            row["times"] = shifted
-            data[key] = row
 
     data["maintenanceDynamicMeta"] = {
         "anchor": new_anchor.astimezone(KST).isoformat(),
         "sourceId": new_source,
         "sourceTitle": str(source_title or ""),
-        "previousAnchor": bound_anchor.astimezone(KST).isoformat(),
-        "clockShiftMinutes": delta,
+        "previousAnchor": previous.astimezone(KST).isoformat() if previous is not None else "",
+        "clockShiftMinutes": 0,
+        "policy": "agro-only-fixed-weekly-v2",
         "updatedAt": datetime.now(KST).isoformat(),
     }
-    ok = _save_boss_schedule_overrides(data)
-    if ok:
-        _apply_manual_schedule_overrides()
-        for key in ("어비스", "시공", "균열", "아티", "필드보스"):
-            _clear_schedule_delivery_keys(key)
-    return ok
+    return _save_boss_schedule_overrides(data)
 
 def _manual_agro_anchor_for_source(source_id=None, official_anchor=None):
     """Keep manual Agro time until an official maintenance confirmation is newer."""
@@ -8126,18 +8094,18 @@ def _set_manual_schedule(name, hour, minute):
     elif key == "나흐마":
         data["nahma"] = {"hour": hour, "minute": minute}
     elif key in ("어비스", "어비스보스"):
-        data["abyss"] = {"hour": hour, "minute": minute}
+        data["abyss"] = {"hour": hour, "minute": minute, "manual": True, "manualUpdatedAt": now.isoformat()}
     elif key == "시공":
         # Existing timetable is a 3-hour pair: 20:00 / 23:00.
         base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         second = base + timedelta(hours=3)
-        data["sigong"] = {"times": [[hour, minute], [second.hour, second.minute]]}
+        data["sigong"] = {"times": [[hour, minute], [second.hour, second.minute]], "manual": True, "manualUpdatedAt": now.isoformat()}
     elif key in ("균영", "균열", "균열지대"):
-        data["gyunyeol"] = {"times": [[hour, minute]]}
+        data["gyunyeol"] = {"times": [[hour, minute]], "manual": True, "manualUpdatedAt": now.isoformat()}
     elif key in ("아티", "아티쟁"):
-        data["ati"] = {"times": [[hour, minute]]}
+        data["ati"] = {"times": [[hour, minute]], "manual": True, "manualUpdatedAt": now.isoformat()}
     elif key in ("필보", "필드보스"):
-        data["fieldboss"] = {"times": [[hour, minute]]}
+        data["fieldboss"] = {"times": [[hour, minute]], "manual": True, "manualUpdatedAt": now.isoformat()}
     else:
         return False
 
@@ -8678,10 +8646,11 @@ async def refresh_boss_rules(force=False):
     """Apply the saved schedule policy without letting old board text rewrite it.
 
     Policy:
-    - Kaira and Nahma are fixed schedules (manual correction can still be saved).
-    - Agro/Abyss/Sigong/Gyunyeol/Ati/Field Boss are maintenance-based.
-    - Only latest_maintenance_anchor() may move maintenance-based schedules, and
-      only after a genuinely newer maintenance notice is confirmed.
+    - Weekly/daily content clocks are fixed published schedules; explicit manual
+      corrections can still be saved.
+    - Only Agro uses the confirmed maintenance END as its respawn anchor.
+    - Maintenance may suppress alerts while active, but it never shifts fixed
+      Sigong/Rift/Artifact/Abyss/Field-Boss clock times.
     """
     now_ts = time.time()
     if not force and now_ts - float(_boss_rule_refresh.get("ts") or 0) < 300:
