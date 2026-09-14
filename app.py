@@ -10397,22 +10397,22 @@ def _yunbot_v8_pack_schedule(key, name, item_type, occurrences):
 
 @app.get("/openchat/schedule-snapshot")
 async def openchat_schedule_snapshot(room: str = "YUNBOT", room_alias: str = "윤이봇"):
-    """Return the common schedule used by YUNBOT V8.
+    """Return the common schedule used by YUNBOT V8 without blocking on NC.
 
-    This route deliberately contains no per-Kakao-room override state.
-    MessengerBotR stores room-specific clock offsets and alert lead times
-    locally and resets only those clock offsets when `generation` changes.
+    The phone polls this route every 15 seconds.  Waiting here for the official
+    board / boss-rule network refresh can make MessengerBotR hit its HTTP timeout
+    and report "공통 일정 조회 실패" even though the schedule itself is known.
+    Refresh those external sources in the background and answer immediately from
+    the last confirmed/persisted values plus the built-in fixed timetable.
     """
     now = datetime.now(KST)
+    _kick_openchat_alert_source_refresh()
     try:
-        await refresh_boss_rules()
+        _apply_manual_schedule_overrides()
     except Exception:
         pass
 
-    try:
-        common_agro_anchor = await latest_maintenance_anchor()
-    except Exception:
-        common_agro_anchor = _persisted_official_agro_anchor() or AGRO_FALLBACK_ANCHOR
+    common_agro_anchor = _cached_alert_agro_anchor()
 
     official_info = _persisted_official_agro_info()
     official_anchor = official_info.get("anchor")
@@ -10739,9 +10739,10 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 # Up to 3 minutes of retry time. For a 2m test lead, retry
                 # until just before the event instead of disappearing after one GET.
                 # PWA push gets a wider retry/catch-up window so a brief
-                # Render cold start or one missed external tick does not lose
-                # the 30m/10m alert. Messenger rooms keep the tighter 3m window.
-                window = min(6 if room_key == PWA_PUSH_ROOM else 3, lead)
+                # Render cold start or one missed phone tick must not lose the
+                # 30m/10m alert. Messenger rooms keep a bounded 5m retry window;
+                # ACK/delivery keys still guarantee one successful delivery only.
+                window = min(6 if room_key == PWA_PUSH_ROOM else 5, lead)
                 if max(0, lead - window) < minutes <= lead:
                     items.append({
                         "type": item_type,
