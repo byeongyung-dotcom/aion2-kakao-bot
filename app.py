@@ -9037,6 +9037,12 @@ async def fetch_board_latest(command: str, limit: int = 5):
 
 NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v3-20260908"
 NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
+# Historical board catch-up is intentionally disabled from this version onward.
+# A fresh delivery cursor is established on deploy/version migration, then only
+# posts published after each board's last successful check are eligible.
+BOARD_DELIVERY_VERSION = "board-fresh-v1-20260915"
+BOARD_PENDING_MAX_AGE_SECONDS = 6 * 60 * 60
+BOARD_POST_TIME_GRACE_SECONDS = 90
 
 
 def _classify_notice_kind(title):
@@ -9967,6 +9973,8 @@ def _default_openchat_delivery_state():
         "lastAckAt": "",
         "noticeClassifierVersion": "",
         "noticeRecoveryVersion": "",
+        "boardDeliveryVersion": "",
+        "boardCheckedAt": {"공지": "", "CM": "", "업데이트": ""},
         "maintenanceSourceId": "",
         "maintenanceAnchor": "",
         "maintenancePending": None,
@@ -10011,9 +10019,12 @@ def _normalize_openchat_delivery(raw):
             if str(key) and expiry_f > now_epoch - 60:
                 clean_leases[str(key)] = expiry_f
         out["leases"] = clean_leases
-    for field in ("lastPollAt", "lastAlias", "lastAckAt", "noticeClassifierVersion", "noticeRecoveryVersion", "maintenanceSourceId", "maintenanceAnchor"):
+    for field in ("lastPollAt", "lastAlias", "lastAckAt", "noticeClassifierVersion", "noticeRecoveryVersion", "boardDeliveryVersion", "maintenanceSourceId", "maintenanceAnchor"):
         if field in raw:
             out[field] = str(raw.get(field) or "")
+    if isinstance(raw.get("boardCheckedAt"), dict):
+        for board_name in ("공지", "CM", "업데이트"):
+            out["boardCheckedAt"][board_name] = str(raw["boardCheckedAt"].get(board_name) or "")
     if isinstance(raw.get("maintenancePending"), dict):
         out["maintenancePending"] = dict(raw.get("maintenancePending") or {})
     return out
@@ -10818,27 +10829,80 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             item = row.get("item")
             if not isinstance(item, dict) or not str(item.get("key") or "").strip():
                 continue
+            created = _alert_float(row.get("created"), 0.0)
+            posted = _parse_board_post_datetime(item.get("postedAt"))
+            if created > 0 and now_epoch - created > BOARD_PENDING_MAX_AGE_SECONDS:
+                continue
+            if posted is not None and (now - posted).total_seconds() > BOARD_PENDING_MAX_AGE_SECONDS:
+                continue
             pending.append(row)
 
-        if first_run:
+        # One-time delivery migration/reset: discard any historical backlog from
+        # older alert logic and establish the current top posts as a clean cursor.
+        # This prevents redeploy/recovery code from replaying days-old notices.
+        if str(delivery.get("boardDeliveryVersion") or "") != BOARD_DELIVERY_VERSION:
+            pending = []
+            delivery["boardPending"] = []
+            delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
+            delivery["boardDeliveryVersion"] = BOARD_DELIVERY_VERSION
+            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
             for board, rows in latest_by_board.items():
                 if rows:
                     delivery["lastSeen"][board] = rows[0]["id"]
+                    checked[board] = now.isoformat()
+            delivery["boardCheckedAt"] = checked
+            delivery["initialized"] = True
+            if latest_by_board.get("공지"):
+                delivery["noticeClassifierVersion"] = NOTICE_ALERT_CLASSIFIER_VERSION
+            state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
+            _save_openchat_alert_state(state)
+            return {
+                "ok": True,
+                "enabled": True,
+                "room": room_key,
+                "baseline": True,
+                "items": [],
+            }
+
+        if first_run:
+            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
+            for board, rows in latest_by_board.items():
+                if rows:
+                    delivery["lastSeen"][board] = rows[0]["id"]
+                    checked[board] = now.isoformat()
+            delivery["boardCheckedAt"] = checked
             delivery["initialized"] = True
         else:
             known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
+            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
             for board, rows in latest_by_board.items():
                 if not rows:
+                    # Do not advance this board's time cursor on a failed/empty fetch.
                     continue
+
                 previous_id = delivery["lastSeen"].get(board)
+                previous_checked = _parse_kst_iso(checked.get(board))
                 new_rows = []
                 for row in rows:
                     if previous_id is not None and str(row["id"]) == str(previous_id):
                         break
                     new_rows.append(row)
+
                 delivery["lastSeen"][board] = rows[0]["id"]
+                checked[board] = now.isoformat()
 
                 for post in reversed(new_rows):
+                    posted = _parse_board_post_datetime(post.get("postedAt"))
+                    # ID changes alone are never enough to replay historical rows.
+                    # A post must have been published after this board's last
+                    # successful check (with a small clock/API ordering grace).
+                    if previous_checked is None or posted is None:
+                        continue
+                    if posted < previous_checked - timedelta(seconds=BOARD_POST_TIME_GRACE_SECONDS):
+                        continue
+                    if (now - posted).total_seconds() > BOARD_PENDING_MAX_AGE_SECONDS:
+                        continue
+
                     kind = None
                     if board == "공지":
                         kind = _classify_notice_kind(post.get("title") or "")
@@ -10856,6 +10920,7 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                         "kind": kind,
                         "id": post["id"],
                         "title": post["title"],
+                        "postedAt": str(post.get("postedAt") or ""),
                         "message": card_url,
                         "cardUrl": card_url,
                         "officialUrl": str(post.get("link") or ""),
@@ -10864,37 +10929,14 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     pending.append({"created": now_epoch, "item": item})
                     known_pending.add(key)
 
-        # Classifier-upgrade recovery.
-        # Important: do NOT consume the recovery merely because one poll ran.
-        # It is considered complete only after the phone actually sends it and ACKs.
-        # This also uses its own key so a legacy pre-ACK boardSent/sentKeys entry
-        # cannot suppress the one recovery alert the user explicitly missed.
-        if str(delivery.get("noticeRecoveryVersion") or "") != NOTICE_RECOVERY_VERSION:
-            sent_keys_for_recovery = set(str(x) for x in (delivery.get("sentKeys") or []) if str(x))
-            known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
-            notice_rows = latest_by_board.get("공지") or []
-            for post in notice_rows:
-                kind = _classify_notice_kind(post.get("title") or "")
-                if not kind or not _board_post_is_recent(post, now=now, max_hours=36):
-                    continue
-                recovery_key = f"NOTICE_RECOVERY|{NOTICE_RECOVERY_VERSION}|{post['id']}"
-                if recovery_key in sent_keys_for_recovery or recovery_key in known_pending:
-                    break
-                card_url = board_card_url("공지", post["id"])
-                item = {
-                    "type": "board_card",
-                    "board": "공지",
-                    "kind": kind,
-                    "id": post["id"],
-                    "title": post["title"],
-                    "message": card_url,
-                    "cardUrl": card_url,
-                    "officialUrl": str(post.get("link") or ""),
-                    "key": recovery_key,
-                }
-                pending.append({"created": now_epoch, "item": item})
-                break
+            delivery["boardCheckedAt"] = checked
 
+        # Historical classifier-recovery is intentionally disabled. It previously
+        # searched up to 36 hours back and could replay an old maintenance/live
+        # notice after a deploy or state migration.
+        delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
+
+        # Legacy 36-hour classifier recovery removed in BOARD_DELIVERY_VERSION.
         # Record the classifier version only when the notice source was actually fetched.
         # This is diagnostic only; recovery completion itself is ACK-gated above.
         if latest_by_board.get("공지"):
