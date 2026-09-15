@@ -7722,6 +7722,30 @@ def _get_schedule_alert_leads(name, room=""):
     return sorted(cleaned, reverse=True) if cleaned else list(DEFAULT_SCHEDULE_ALERT_LEADS)
 
 
+def _schedule_alert_lower_bound(leads, lead):
+    """Return the next configured lead, or zero for the final alert.
+
+    This partitions recovery time between leads. With 30/10 configured, the
+    30-minute alert remains eligible until the 10-minute alert begins, and the
+    10-minute alert remains eligible until the event starts. There are no dead
+    gaps and only one lead is eligible at any moment.
+    """
+    cleaned = []
+    for value in leads or []:
+        try:
+            number = int(value)
+        except Exception:
+            continue
+        if number >= 1 and number not in cleaned:
+            cleaned.append(number)
+    cleaned.sort(reverse=True)
+    try:
+        index = cleaned.index(int(lead))
+    except Exception:
+        return 0
+    return cleaned[index + 1] if index + 1 < len(cleaned) else 0
+
+
 def _scheduled_alert_key(room, name, target, lead):
     """Stable per-room key for one scheduled alert occurrence.
 
@@ -9043,6 +9067,8 @@ NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
 BOARD_DELIVERY_VERSION = "board-fresh-v1-20260915"
 BOARD_PENDING_MAX_AGE_SECONDS = 6 * 60 * 60
 BOARD_POST_TIME_GRACE_SECONDS = 90
+BOARD_AUTO_FETCH_TIMEOUT_SECONDS = 11.0
+BOARD_CHECK_MIN_INTERVAL_SECONDS = 20.0
 
 
 def _classify_notice_kind(title):
@@ -9172,7 +9198,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V11 ALERT RETRY FIX"
+PWA_APP_VERSION = "V11 ALERT FULL FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10727,6 +10753,26 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                     "key": test_key,
                 })
 
+        # Already discovered board items belong on the fast path. Retrying a
+        # pending CM/notice/update must not wait for three upstream board calls
+        # again, because that delay can exceed the phone's HTTP timeout.
+        valid_board_pending = []
+        for row in (delivery.get("boardPending") or []):
+            if not isinstance(row, dict):
+                continue
+            item = row.get("item")
+            if not isinstance(item, dict) or not str(item.get("key") or "").strip():
+                continue
+            created = _alert_float(row.get("created"), 0.0)
+            posted = _parse_board_post_datetime(item.get("postedAt"))
+            if created > 0 and now_epoch - created > BOARD_PENDING_MAX_AGE_SECONDS:
+                continue
+            if posted is not None and (now - posted).total_seconds() > BOARD_PENDING_MAX_AGE_SECONDS:
+                continue
+            valid_board_pending.append(row)
+            items.append(item)
+        delivery["boardPending"] = valid_board_pending
+
         # Scheduled alerts are recomputed every poll and are NOT consumed.
         # During maintenance they are completely suppressed. After maintenance,
         # any lead whose trigger time fell inside the maintenance interval is
@@ -10743,18 +10789,13 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             if target is None:
                 continue
             minutes = (target - now).total_seconds() / 60.0
-            for lead in _get_schedule_alert_leads(name, room):
+            leads = _get_schedule_alert_leads(name, room)
+            for lead in leads:
                 trigger_dt = target - timedelta(minutes=int(lead))
                 if _alert_trigger_blocked_by_maintenance(trigger_dt, now=now):
                     continue
-                # Up to 3 minutes of retry time. For a 2m test lead, retry
-                # until just before the event instead of disappearing after one GET.
-                # PWA push gets a wider retry/catch-up window so a brief
-                # Render cold start or one missed phone tick must not lose the
-                # 30m/10m alert. Messenger rooms keep a bounded 5m retry window;
-                # ACK/delivery keys still guarantee one successful delivery only.
-                window = min(6 if room_key == PWA_PUSH_ROOM else 5, lead)
-                if max(0, lead - window) < minutes <= lead:
+                lower_bound = _schedule_alert_lower_bound(leads, lead)
+                if lower_bound < minutes <= lead:
                     items.append({
                         "type": item_type,
                         "boss": name if item_type == "boss" else None,
@@ -10800,16 +10841,34 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             return {"ok": True, "enabled": True, "room": room_key, "baseline": first_run, "items": fresh_items}
 
     # ---------------- BOARD PATH ----------------
+    # Avoid three upstream calls on every 15-second phone poll. Newly detected
+    # items are still pending/ACK-gated, and pending items are served by the fast
+    # path above on the very next request.
+    async with _openchat_alert_lock:
+        state = _load_openchat_alert_state()
+        _, delivery = _openchat_get_delivery(state, room)
+        checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
+        due_boards = []
+        for board_name in ("공지", "CM", "업데이트"):
+            checked_at = _parse_kst_iso(checked.get(board_name))
+            if checked_at is None or (now - checked_at).total_seconds() >= BOARD_CHECK_MIN_INTERVAL_SECONDS:
+                due_boards.append(board_name)
+
     async def _fetch_board(board_name):
         try:
             board_limit = 50 if board_name == "공지" else 18
-            return await asyncio.wait_for(fetch_board_latest(board_name, limit=board_limit), timeout=4.0)
+            return await asyncio.wait_for(
+                fetch_board_latest(board_name, limit=board_limit),
+                timeout=BOARD_AUTO_FETCH_TIMEOUT_SECONDS,
+            )
         except Exception:
             return []
 
     boards = ("공지", "CM", "업데이트")
-    results = await asyncio.gather(*[_fetch_board(b) for b in boards])
-    latest_by_board = dict(zip(boards, results))
+    latest_by_board = {board: None for board in boards}
+    if due_boards:
+        results = await asyncio.gather(*[_fetch_board(b) for b in due_boards])
+        latest_by_board.update(dict(zip(due_boards, results)))
 
     async with _openchat_alert_lock:
         state = _load_openchat_alert_state()
@@ -11189,7 +11248,7 @@ def _save_pwa_alert_settings(settings):
 def _pwa_item_enabled(item, settings=None):
     settings = settings or _get_pwa_alert_settings()
     typ = str((item or {}).get("type") or "")
-    if typ == "board":
+    if typ in ("board", "board_card"):
         return bool((settings.get("boards") or {}).get(str(item.get("board") or ""), True))
     if typ in ("boss", "content"):
         name = str(item.get("boss") or item.get("content") or "")
@@ -11255,7 +11314,7 @@ def _pwa_push_payload(item):
     item = item or {}
     typ = str(item.get("type") or "")
     key = str(item.get("key") or "")
-    if typ == "board":
+    if typ in ("board", "board_card"):
         board = str(item.get("board") or "공지")
         icon = "📢" if board in ("공지", "CM") else "🆕"
         return {
@@ -12878,8 +12937,8 @@ async def _format_openchat_alert_diagnostic(room: str = "", room_label: str = ""
         for lead in leads:
             key = _scheduled_alert_key(room, name, target, lead)
             legacy_key = _legacy_scheduled_alert_key(name, target, lead)
-            window = min(3, lead)
-            if max(0, lead - window) < minutes <= lead:
+            lower_bound = _schedule_alert_lower_bound(leads, lead)
+            if lower_bound < minutes <= lead:
                 eligible = lead
                 already = key in sent or legacy_key in sent
                 break
@@ -13466,7 +13525,3 @@ async def _official_resolve_character_strict(nickname: str, server: str):
     except Exception:
         pass
     return None
-
-
-
-
