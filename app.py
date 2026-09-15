@@ -11946,6 +11946,65 @@ async def _refresh_card_basic_info(nickname: str, server_name: str, seed_info=No
     return info
 
 
+async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed_info=None):
+    """Fetch only the latest official portrait used by the character preview card.
+
+    Character customization can change while combat power/job remain unchanged, so
+    the normal "basic info incomplete" gate is not sufficient for the OG preview.
+    This helper intentionally changes only profileImage and leaves every other card
+    field/feature untouched.
+    """
+    nickname = str(nickname or "").strip()
+    server_name = resolve_server_alias(server_name) or str(server_name or "").strip()
+    info = dict(seed_info or {})
+    if not nickname or server_name not in SERVER_ID_MAP:
+        return str(info.get("profileImage") or "")
+
+    sid = int(info.get("serverId") or SERVER_ID_MAP.get(server_name) or 0)
+    cid = str(info.get("characterId") or "").strip()
+
+    # Normally the search/DB row already has characterId. If it does not, do one
+    # server-specific live identity lookup, but still consume only its image field.
+    if not cid:
+        try:
+            resolved = await asyncio.wait_for(
+                _fresh_official_character(nickname, server_name), timeout=2.6
+            )
+            if isinstance(resolved, dict) and resolved.get("type") == "detail":
+                row = resolved.get("row") or {}
+                fresh_info = resolved.get("info") or {}
+                sid = int(row_server_id(row) or fresh_info.get("serverId") or sid or 0)
+                cid = str(row_character_id(row) or fresh_info.get("characterId") or "").strip()
+                fresh_image = str(fresh_info.get("profileImage") or "").strip()
+                if fresh_image:
+                    return fresh_image
+        except Exception:
+            pass
+
+    if not sid or not cid:
+        return str(info.get("profileImage") or "")
+
+    try:
+        detail = await _official_get_json_live(
+            OFFICIAL_CHARACTER_INFO_API,
+            params={"lang": "ko", "characterId": cid, "serverId": sid},
+            timeout=httpx.Timeout(connect=1.2, read=2.6, write=1.2, pool=1.2),
+        )
+        profile = detail.get("profile") or {}
+        fresh_image = str(
+            profile.get("profileImage")
+            or profile.get("imageUrl")
+            or detail.get("profileImage")
+            or ""
+        ).strip()
+        if fresh_image:
+            return fresh_image
+    except Exception:
+        pass
+
+    return str(info.get("profileImage") or "")
+
+
 async def character_card_data_fast(nickname: str, server_name: str):
     """Fast OG-card snapshot with basic-info repair for identity-only first hits."""
     nickname = str(nickname or "").strip()
@@ -12012,11 +12071,27 @@ async def character_card_data_fast(nickname: str, server_name: str):
 
     # Critical fix: an existing DB row is NOT automatically considered complete.
     # Identity-only rows have CP=0/job blank. Refresh those before rendering.
-    if not info or _card_info_incomplete(info):
+    needs_basic_refresh = not info or _card_info_incomplete(info)
+    if needs_basic_refresh:
         try:
             info = await asyncio.wait_for(
                 _refresh_card_basic_info(nickname, server_name, info), timeout=2.75
             )
+        except Exception:
+            pass
+
+    # Preview portrait freshness is independent of CP/job. A user can change only
+    # character customization, leaving every other field unchanged. For a complete
+    # DB row, refresh ONLY profileImage. In the incomplete-row path above, the same
+    # live official detail call already refreshed the image, so do not add a second
+    # network request or alter any other field.
+    if info and not needs_basic_refresh:
+        try:
+            latest_image = await asyncio.wait_for(
+                _refresh_card_profile_image_only(nickname, server_name, info), timeout=1.9
+            )
+            if latest_image:
+                info["profileImage"] = latest_image
         except Exception:
             pass
 
