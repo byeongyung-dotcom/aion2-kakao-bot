@@ -11963,6 +11963,68 @@ async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed
     sid = int(info.get("serverId") or SERVER_ID_MAP.get(server_name) or 0)
     cid = str(info.get("characterId") or "").strip()
 
+    async def resolve_current_image(image_url):
+        """Resolve the stable PlayNC portrait URL to its current versioned image."""
+        image_url = str(image_url or "").strip()
+        if not image_url:
+            return ""
+
+        # profileimg.plaync.com keeps the same charKey URL after customization
+        # and redirects it to the current versioned CDN file.  Kakao can retain
+        # the old redirect when that stable URL is used directly as og:image.
+        # Resolve the redirect here with a one-request cache buster so the card
+        # receives the current appearance URL instead.
+        parsed = urlparse(image_url)
+        host = str(parsed.hostname or "").casefold()
+        if host != "profileimg.plaync.com":
+            return image_url
+
+        base, fragment_mark, fragment = image_url.partition("#")
+        separator = "&" if "?" in base else "?"
+        live_url = f"{base}{separator}_yunimg={int(time.time() * 1000)}"
+        if fragment_mark:
+            live_url += "#" + fragment
+
+        try:
+            headers = dict(OFFICIAL_API_HEADERS)
+            headers["Cache-Control"] = "no-cache, no-store, max-age=0"
+            headers["Pragma"] = "no-cache"
+            client = await get_http_client()
+            response = await client.get(
+                live_url,
+                headers=headers,
+                follow_redirects=False,
+                timeout=httpx.Timeout(connect=1.2, read=1.8, write=1.2, pool=1.2),
+            )
+            if 300 <= response.status_code < 400:
+                location = str(response.headers.get("location") or "").strip()
+                resolved_url = urljoin(live_url, location) if location else ""
+                resolved = urlparse(resolved_url)
+                resolved_host = str(resolved.hostname or "").casefold()
+                if (
+                    resolved.scheme == "https"
+                    and (
+                        resolved_host == "playnccdn.com"
+                        or resolved_host.endswith(".playnccdn.com")
+                        or resolved_host == "plaync.com"
+                        or resolved_host.endswith(".plaync.com")
+                    )
+                ):
+                    return resolved_url
+        except Exception:
+            pass
+
+        # Even if redirect resolution is temporarily slow, keep the cache-busted
+        # stable URL so Kakao does not reuse the previous portrait redirect.
+        return live_url
+
+    # Existing official DB images normally use the stable profileimg URL.  It
+    # already identifies this exact character by charKey, so resolving that URL
+    # is the fastest and freshest appearance-only path and needs no data refresh.
+    seed_image = str(info.get("profileImage") or "").strip()
+    if str(urlparse(seed_image).hostname or "").casefold() == "profileimg.plaync.com":
+        return await resolve_current_image(seed_image)
+
     # Normally the search/DB row already has characterId. If it does not, do one
     # server-specific live identity lookup, but still consume only its image field.
     if not cid:
@@ -11977,7 +12039,7 @@ async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed
                 cid = str(row_character_id(row) or fresh_info.get("characterId") or "").strip()
                 fresh_image = str(fresh_info.get("profileImage") or "").strip()
                 if fresh_image:
-                    return fresh_image
+                    return await resolve_current_image(fresh_image)
         except Exception:
             pass
 
@@ -11998,11 +12060,11 @@ async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed
             or ""
         ).strip()
         if fresh_image:
-            return fresh_image
+            return await resolve_current_image(fresh_image)
     except Exception:
         pass
 
-    return str(info.get("profileImage") or "")
+    return await resolve_current_image(info.get("profileImage"))
 
 
 async def character_card_data_fast(nickname: str, server_name: str):
@@ -13404,7 +13466,6 @@ async def _official_resolve_character_strict(nickname: str, server: str):
     except Exception:
         pass
     return None
-
 
 
 
