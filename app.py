@@ -116,7 +116,7 @@ def _safe_json_load(path, default):
 
 # Character API - current NotMeter endpoint
 NOTMETER_API = "https://notmeter.59-27-108-81.sslip.io"
-NOTMETER_CHARACTER_API = "https://notmeter.112-168-140-142.sslip.io"
+NOTMETER_CHARACTER_API = NOTMETER_API
 
 # Field boss public cache.
 # NotMeter itself uses GitHub first, then its VPS endpoint.
@@ -1538,6 +1538,106 @@ async def _fresh_official_character(nickname, server_name=None):
     }
 
 
+async def _fresh_notmeter_character(nickname, server_name=None):
+    """Resolve exact character identity through the current NotMeter endpoint.
+
+    This path is intentionally identity-only.  A valid search row must be usable
+    even while the slower profile/detail data is still warming upstream.
+    """
+    nickname = str(nickname or "").strip()
+    server_name = str(server_name or "").strip() or None
+    if not nickname:
+        return None
+
+    params = {
+        "name": nickname,
+        "region": "kr",
+        "lang": "ko",
+        "fast": "1",
+    }
+    target_sid = 0
+    if server_name:
+        target_sid = int(SERVER_ID_MAP.get(server_name) or 0)
+        if not target_sid:
+            return None
+        params["serverId"] = target_sid
+
+    try:
+        data = await character_api_get(
+            "/character/v1/search",
+            params,
+            timeout=httpx.Timeout(
+                connect=15.0,
+                read=20.0,
+                write=3.0,
+                pool=3.0,
+            ),
+        )
+    except Exception:
+        return None
+
+    exact = []
+    for raw in (data.get("results") or data.get("characters") or []):
+        if not isinstance(raw, dict):
+            continue
+        if row_name(raw).casefold() != nickname.casefold():
+            continue
+        sid = row_server_id(raw)
+        sname = row_server_name(raw)
+        if target_sid and sid != target_sid and sname.casefold() != server_name.casefold():
+            continue
+        cid = unquote(row_character_id(raw))
+        if not sid or not cid:
+            continue
+        row = dict(raw)
+        row["characterId"] = cid
+        row["serverName"] = sname or SERVER_NAME_BY_ID.get(sid, "")
+        profile_image = str(row.get("profileImage") or "").strip()
+        if str(urlparse(profile_image).hostname or "").casefold() == "profileimg.plaync.com":
+            separator = "&" if "?" in profile_image else "?"
+            row["profileImage"] = (
+                f"{profile_image}{separator}_yunimg={int(time.time() * 1000)}"
+            )
+        exact.append(row)
+
+    if not exact:
+        return None
+
+    exact.sort(
+        key=lambda row: (
+            -int(row.get("combatPower") or 0),
+            row_server_id(row),
+        )
+    )
+
+    if server_name or len(exact) == 1:
+        row = exact[0]
+        actual_server = row_server_name(row) or server_name or SERVER_NAME_BY_ID.get(row_server_id(row), "")
+        info = profile_info({}, nickname, actual_server, row)
+        info["characterId"] = row_character_id(row)
+        _start_character_detail_warm(row, nickname)
+        return {
+            "type": "detail",
+            "row": row,
+            "profile": {},
+            "info": info,
+            "stones": [],
+            "freshIdentityOnly": True,
+        }
+
+    return {
+        "type": "multiple",
+        "items": [
+            {
+                "row": row,
+                "info": profile_info({}, nickname, row_server_name(row), row),
+            }
+            for row in exact[:12]
+        ],
+        "freshIdentityOnly": True,
+    }
+
+
 async def own_resolve_character(nickname, server_name=None):
     """Resolve one character without requiring a second user request.
 
@@ -1614,61 +1714,34 @@ async def own_resolve_character(nickname, server_name=None):
             except Exception:
                 pass
 
-    # 1) NC official exact search.  _fresh_official_character now treats the
-    # exact search row as identity even when the detail endpoint is cold.
+    # 1) Race the official search with the current NotMeter character endpoint.
+    # The retired NotMeter host returned 502, while running these sequentially
+    # left no time for the healthy source after a slow NC connection failure.
+    lookup_tasks = {
+        asyncio.create_task(_fresh_official_character(nickname, server_name)),
+        asyncio.create_task(_fresh_notmeter_character(nickname, server_name)),
+    }
     try:
-        official = await asyncio.wait_for(
-            _fresh_official_character(nickname, server_name),
-            timeout=27.0,
-        )
-        if official:
-            await _save_notmeter_resolved(official)
-            return official
-    except Exception:
-        pass
-
-    # 2) For an explicit server, use NotMeter's SERVER-SPECIFIC search endpoint.
-    # The old code used all-server search here, which is exactly the path that can
-    # return zero on a first cold hit and then work on the second request.
-    if server_name and server_name in SERVER_ID_MAP:
-        try:
-            matched = await asyncio.wait_for(
-                search_character_on_server(nickname, server_name),
-                timeout=3.6,
-            )
-            if matched:
-                matched = sorted(
-                    matched,
-                    key=lambda row: int(row.get("combatPower") or 0),
-                    reverse=True,
-                )
-                row = matched[0]
-                try:
-                    detail = await asyncio.wait_for(load_detail(row, nickname), timeout=2.8)
-                except Exception:
-                    detail = {
-                        "row": row,
-                        "profile": {},
-                        "info": profile_info({}, nickname, server_name, row),
-                        "stones": [],
-                    }
-                resolved = {"type": "detail", **detail}
+        for completed in asyncio.as_completed(lookup_tasks, timeout=29.0):
+            try:
+                resolved = await completed
+            except Exception:
+                continue
+            if resolved and resolved.get("type") != "none":
+                for task in lookup_tasks:
+                    if not task.done():
+                        task.cancel()
                 await _save_notmeter_resolved(resolved)
                 return resolved
-        except Exception:
-            pass
-    else:
-        # Server-less lookup keeps the existing all-server NotMeter fallback.
-        _cache.pop(f"char-search:{nickname.casefold()}", None)
-        try:
-            fresh = await asyncio.wait_for(resolve_character(nickname, None), timeout=3.2)
-            if fresh and fresh.get("type") != "none":
-                await _save_notmeter_resolved(fresh)
-                return fresh
-        except Exception:
-            pass
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        for task in lookup_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*lookup_tasks, return_exceptions=True)
 
-    # 3) One bounded in-request retry only when there is still time.  A user should
+    # 2) One bounded in-request retry only when there is still time.  A user should
     # never have to type the same command twice just to warm the upstream service.
     elapsed = time.monotonic() - resolve_started
     if elapsed < 8.2:
@@ -1685,7 +1758,7 @@ async def own_resolve_character(nickname, server_name=None):
         except Exception:
             pass
 
-    # 4) Last saved value only after all identity sources fail.
+    # 3) Last saved value only after all identity sources fail.
     db_infos = await character_db_get(nickname, server_name)
     return _db_resolved_from_infos(db_infos)
 
@@ -9225,7 +9298,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V11 CHARACTER TLS FIX"
+PWA_APP_VERSION = "V12 CHARACTER ENDPOINT FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9899,7 +9972,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-tls-connect-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-endpoint-fix"}
 
 
 @app.get("/manifest.webmanifest")
