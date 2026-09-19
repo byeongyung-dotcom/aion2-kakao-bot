@@ -1327,7 +1327,7 @@ async def _official_get_json_live(url, params=None, timeout=None):
         params=params,
         headers=headers,
         timeout=timeout or httpx.Timeout(
-            connect=2.0, read=4.0, write=2.0, pool=2.0
+            connect=15.0, read=15.0, write=3.0, pool=3.0
         ),
     )
     response.raise_for_status()
@@ -1347,7 +1347,7 @@ async def _warm_official_character_detail(row, nickname):
         detail = await _official_get_json_live(
             OFFICIAL_CHARACTER_INFO_API,
             params={"lang": "ko", "characterId": cid, "serverId": sid},
-            timeout=httpx.Timeout(connect=2.0, read=15.0, write=2.0, pool=2.0),
+            timeout=httpx.Timeout(connect=15.0, read=15.0, write=3.0, pool=3.0),
         )
         info = _official_info_from_live_data(row, detail)
         if str(info.get("name") or "").casefold() != str(nickname or "").casefold():
@@ -1452,7 +1452,7 @@ async def _fresh_official_character(nickname, server_name=None):
                     "race": _official_server_race(sid),
                     "serverId": int(sid),
                 },
-                timeout=httpx.Timeout(connect=3.0, read=25.0, write=3.0, pool=2.0),
+                timeout=httpx.Timeout(connect=15.0, read=20.0, write=3.0, pool=3.0),
             )
         except Exception:
             return None
@@ -1585,7 +1585,7 @@ async def own_resolve_character(nickname, server_name=None):
                         detail = await _official_get_json_live(
                             OFFICIAL_CHARACTER_INFO_API,
                             params={"lang": "ko", "characterId": cid, "serverId": int(sid)},
-                            timeout=httpx.Timeout(connect=1.2, read=2.4, write=1.2, pool=1.2),
+                            timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
                         )
                         enriched = _official_info_from_live_data(row, detail)
                         if str(enriched.get("name") or "").casefold() == nickname.casefold():
@@ -1855,7 +1855,7 @@ async def _official_get_json(url, params=None, timeout=None):
             params=params,
             headers=OFFICIAL_API_HEADERS,
             timeout=timeout or httpx.Timeout(
-                connect=3.0,
+                connect=15.0,
                 read=12.0,
                 write=3.0,
                 pool=2.0,
@@ -2656,12 +2656,12 @@ async def debug_official_equipped_stats_v2(nickname: str = '윤이', server: str
         equipment_payload = await _official_get_json(
             f'{OFFICIAL_CHARACTER_BASE}/api/character/equipment',
             params=params,
-            timeout=httpx.Timeout(connect=4.0, read=20.0, write=4.0, pool=4.0),
+            timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
         )
         info_payload = await _official_get_json(
             OFFICIAL_CHARACTER_INFO_API,
             params=params,
-            timeout=httpx.Timeout(connect=4.0, read=20.0, write=4.0, pool=4.0),
+            timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
         )
     except Exception as e:
         return {'ok': False, 'error': f'official base API 실패: {type(e).__name__}: {str(e)[:300]}'}
@@ -9225,7 +9225,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V11 CHARACTER SEARCH FIX 2"
+PWA_APP_VERSION = "V11 CHARACTER TLS FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9899,7 +9899,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-search-upstream-fix-2"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-tls-connect-fix"}
 
 
 @app.get("/manifest.webmanifest")
@@ -11997,7 +11997,7 @@ async def _refresh_card_basic_info(nickname: str, server_name: str, seed_info=No
             detail = await _official_get_json_live(
                 OFFICIAL_CHARACTER_INFO_API,
                 params={"lang": "ko", "characterId": cid, "serverId": sid},
-                timeout=httpx.Timeout(connect=1.2, read=2.4, write=1.2, pool=1.2),
+                timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
             )
             fresh = _official_info_from_live_data(row, detail)
             if str(fresh.get("name") or "").casefold() == nickname.casefold():
@@ -12080,7 +12080,7 @@ async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed
                 live_url,
                 headers=headers,
                 follow_redirects=False,
-                timeout=httpx.Timeout(connect=1.2, read=1.8, write=1.2, pool=1.2),
+                timeout=httpx.Timeout(connect=15.0, read=5.0, write=3.0, pool=3.0),
             )
             if 300 <= response.status_code < 400:
                 location = str(response.headers.get("location") or "").strip()
@@ -12136,7 +12136,7 @@ async def _refresh_card_profile_image_only(nickname: str, server_name: str, seed
         detail = await _official_get_json_live(
             OFFICIAL_CHARACTER_INFO_API,
             params={"lang": "ko", "characterId": cid, "serverId": sid},
-            timeout=httpx.Timeout(connect=1.2, read=2.6, write=1.2, pool=1.2),
+            timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
         )
         profile = detail.get("profile") or {}
         fresh_image = str(
@@ -13424,7 +13424,7 @@ async def _official_resolve_character_strict(nickname: str, server: str):
                             'characterId': str(cid),
                             'serverId': server_id,
                         },
-                        timeout=httpx.Timeout(connect=1.5, read=2.5, write=1.5, pool=1.5),
+                        timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
                     )
                     profile = live.get('profile') if isinstance(live, dict) else {}
                     live_name = _strip_html(
@@ -13480,7 +13480,7 @@ async def _official_resolve_character_strict(nickname: str, server: str):
             payload = await _official_get_json(
                 OFFICIAL_CHARACTER_SEARCH_API,
                 params={'keyword': nickname, 'race': race, 'serverId': server_id},
-                timeout=httpx.Timeout(connect=4.0, read=12.0, write=4.0, pool=4.0),
+                timeout=httpx.Timeout(connect=15.0, read=12.0, write=4.0, pool=4.0),
             )
             for item in walk(payload):
                 nm = _strip_html(item.get('name') or item.get('characterName') or item.get('nickname'))
