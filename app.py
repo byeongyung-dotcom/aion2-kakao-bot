@@ -1334,6 +1334,39 @@ async def _official_get_json_live(url, params=None, timeout=None):
     return response.json()
 
 
+CHARACTER_WARM_TASKS = set()
+
+
+async def _warm_official_character_detail(row, nickname):
+    """Fill CP/job after a search hit without delaying the chat response."""
+    try:
+        sid = int(row.get("serverId") or 0)
+        cid = str(row.get("characterId") or "").strip()
+        if not sid or not cid:
+            return
+        detail = await _official_get_json_live(
+            OFFICIAL_CHARACTER_INFO_API,
+            params={"lang": "ko", "characterId": cid, "serverId": sid},
+            timeout=httpx.Timeout(connect=2.0, read=15.0, write=2.0, pool=2.0),
+        )
+        info = _official_info_from_live_data(row, detail)
+        if str(info.get("name") or "").casefold() != str(nickname or "").casefold():
+            return
+        await character_db_upsert(info, character_id=cid, source="plaync-official")
+    except Exception:
+        pass
+
+
+def _start_character_detail_warm(row, nickname):
+    """Keep a strong reference until the background detail refresh completes."""
+    try:
+        task = asyncio.create_task(_warm_official_character_detail(dict(row or {}), nickname))
+        CHARACTER_WARM_TASKS.add(task)
+        task.add_done_callback(CHARACTER_WARM_TASKS.discard)
+    except Exception:
+        pass
+
+
 def _official_info_from_live_data(row, data):
     server_id = int(row.get("serverId") or 0)
     profile = data.get("profile") or {}
@@ -1419,7 +1452,7 @@ async def _fresh_official_character(nickname, server_name=None):
                     "race": _official_server_race(sid),
                     "serverId": int(sid),
                 },
-                timeout=httpx.Timeout(connect=1.6, read=3.8, write=1.6, pool=1.6),
+                timeout=httpx.Timeout(connect=2.0, read=13.0, write=2.0, pool=2.0),
             )
         except Exception:
             return None
@@ -1449,6 +1482,10 @@ async def _fresh_official_character(nickname, server_name=None):
                 "combatPower": int(item.get("combatPower") or 0),
                 "characterLevel": int(item.get("characterLevel") or item.get("level") or 0),
                 "characterId": cid,
+                "profileImage": (
+                    urljoin("https://profileimg.plaync.com", str(item.get("profileImageUrl") or ""))
+                    if item.get("profileImageUrl") else ""
+                ),
                 "officialUrl": (
                     f"{OFFICIAL_CHARACTER_BASE}/ko-kr/characters/"
                     f"{item_sid}/{quote(cid, safe='')}"
@@ -1459,27 +1496,13 @@ async def _fresh_official_character(nickname, server_name=None):
         if not row:
             return None
 
-        # Detail is enrichment, not identity validation.  NC occasionally returns
-        # an empty/slow detail response on the first cold hit while the search row
-        # is already correct.  In that case return the exact search row now.
+        # The exact official search row already proves identity.  The info endpoint
+        # can currently take longer than the whole chat request, so enrich CP/job in
+        # the background and return the card URL immediately.
         info = profile_info({}, nickname, server_name, row)
         info["characterId"] = str(row.get("characterId") or "")
         info["officialUrl"] = str(row.get("officialUrl") or "")
-        try:
-            detail = await _official_get_json_live(
-                OFFICIAL_CHARACTER_INFO_API,
-                params={
-                    "lang": "ko",
-                    "characterId": row["characterId"],
-                    "serverId": int(row["serverId"]),
-                },
-                timeout=httpx.Timeout(connect=1.6, read=3.8, write=1.6, pool=1.6),
-            )
-            enriched = _official_info_from_live_data(row, detail)
-            if str(enriched.get("name") or "").casefold() == nickname.casefold():
-                info = enriched
-        except Exception:
-            pass
+        _start_character_detail_warm(row, nickname)
 
         return {
             "type": "detail",
@@ -1487,32 +1510,31 @@ async def _fresh_official_character(nickname, server_name=None):
             "profile": {},
             "info": info,
             "stones": [],
+            "freshIdentityOnly": True,
         }
 
-    # No server supplied: retain the existing all-server resolver.
+    # No server supplied: return official search identities directly.  Loading a
+    # detail page for every same-name character made a first search exceed the
+    # outer chat timeout whenever PlayNC was slow.
     rows = await official_search_characters(nickname, None)
     if not rows:
         return None
-    details = await asyncio.gather(
-        *[official_load_detail(r) for r in rows[:12]],
-        return_exceptions=True,
-    )
-    valid = []
-    for row, info in zip(rows[:12], details):
-        if isinstance(info, Exception) or not isinstance(info, dict):
-            continue
-        if str(info.get("name") or "").casefold() == nickname.casefold():
-            valid.append((row, info))
-    if not valid:
-        return None
-    valid.sort(key=lambda x: int(x[1].get("combatPower") or 0), reverse=True)
-    row, info = valid[0]
+    items = []
+    for row in rows[:12]:
+        info = profile_info({}, nickname, row_server_name(row), row)
+        info["characterId"] = row_character_id(row)
+        items.append({"row": row, "info": info})
+    if len(items) > 1:
+        return {"type": "multiple", "items": items, "freshIdentityOnly": True}
+    row = items[0]["row"]
+    _start_character_detail_warm(row, nickname)
     return {
         "type": "detail",
         "row": row,
         "profile": {},
-        "info": info,
+        "info": items[0]["info"],
         "stones": [],
+        "freshIdentityOnly": True,
     }
 
 
@@ -1597,7 +1619,7 @@ async def own_resolve_character(nickname, server_name=None):
     try:
         official = await asyncio.wait_for(
             _fresh_official_character(nickname, server_name),
-            timeout=5.2,
+            timeout=13.8,
         )
         if official:
             await _save_notmeter_resolved(official)
@@ -1744,17 +1766,18 @@ async def own_character_lookup_smart(body):
     # the Kakao card URL. The card page itself stays fast and reads this saved
     # full profile locally, so opening the card shows the magic-stone total
     # immediately without doing the expensive equipment crawl in the OG route.
-    try:
-        resolved = await asyncio.wait_for(
-            _lookup_detail_with_saved_stones(
-                resolved,
-                nickname,
-                None,
-            ),
-            timeout=5.5,
-        )
-    except Exception:
-        pass
+    if not resolved.get("freshIdentityOnly"):
+        try:
+            resolved = await asyncio.wait_for(
+                _lookup_detail_with_saved_stones(
+                    resolved,
+                    nickname,
+                    None,
+                ),
+                timeout=5.5,
+            )
+        except Exception:
+            pass
 
     return format_character_from_data(
         resolved.get("info") or {},
@@ -2069,6 +2092,10 @@ async def official_search_characters(nickname, server_name=None):
                     ),
                     "characterLevel": int(item.get("characterLevel") or item.get("level") or 0),
                     "characterId": char_id,
+                    "profileImage": (
+                        urljoin("https://profileimg.plaync.com", str(item.get("profileImageUrl") or ""))
+                        if item.get("profileImageUrl") else ""
+                    ),
                     "officialUrl": (
                         f"{OFFICIAL_CHARACTER_BASE}/ko-kr/characters/"
                         f"{sid}/{quote(char_id, safe='')}"
@@ -9198,7 +9225,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V11 ALERT FULL FIX"
+PWA_APP_VERSION = "V11 CHARACTER SEARCH FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9872,7 +9899,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-07-v11-alert-retry-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-search-timeout-fix"}
 
 
 @app.get("/manifest.webmanifest")
@@ -13238,7 +13265,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
 
     # 위 전용 명령 어느 것도 아닐 때만 캐릭터 검색.
     try:
-        result = await asyncio.wait_for(character_lookup_smart(body), timeout=12.0)
+        result = await asyncio.wait_for(character_lookup_smart(body), timeout=16.5)
     except asyncio.TimeoutError:
         result = "⚠️ 캐릭터 조회 지연"
     except Exception:
