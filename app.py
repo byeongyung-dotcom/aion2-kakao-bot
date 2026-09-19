@@ -1445,14 +1445,14 @@ async def _fresh_official_character(nickname, server_name=None):
             return None
 
         try:
-            data = await _official_get_json_live(
+            data = await _official_get_json(
                 OFFICIAL_CHARACTER_SEARCH_API,
                 params={
                     "keyword": nickname,
                     "race": _official_server_race(sid),
                     "serverId": int(sid),
                 },
-                timeout=httpx.Timeout(connect=2.0, read=13.0, write=2.0, pool=2.0),
+                timeout=httpx.Timeout(connect=3.0, read=25.0, write=3.0, pool=2.0),
             )
         except Exception:
             return None
@@ -1619,7 +1619,7 @@ async def own_resolve_character(nickname, server_name=None):
     try:
         official = await asyncio.wait_for(
             _fresh_official_character(nickname, server_name),
-            timeout=13.8,
+            timeout=27.0,
         )
         if official:
             await _save_notmeter_resolved(official)
@@ -9225,7 +9225,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V11 CHARACTER SEARCH FIX"
+PWA_APP_VERSION = "V11 CHARACTER SEARCH FIX 2"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9899,7 +9899,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-search-timeout-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-search-upstream-fix-2"}
 
 
 @app.get("/manifest.webmanifest")
@@ -13265,7 +13265,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
 
     # 위 전용 명령 어느 것도 아닐 때만 캐릭터 검색.
     try:
-        result = await asyncio.wait_for(character_lookup_smart(body), timeout=16.5)
+        result = await asyncio.wait_for(character_lookup_smart(body), timeout=31.0)
     except asyncio.TimeoutError:
         result = "⚠️ 캐릭터 조회 지연"
     except Exception:
