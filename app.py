@@ -12705,8 +12705,8 @@ def _own_stats_v1_from_official_payload(payload, nickname, server_name, server_i
 
 PARTY_SHEET_ID = "1TDkZojKWuHNfu5cl1lpuqVZvTKF6W9-c9WLjga8ihIc"
 PARTY_CONFIGS = {
-    "무스펠": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I30"},
-    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I30"},
+    "무스펠": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I31"},
+    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I31"},
     "성역4": {"sheet": "성역4", "gid": None, "range": "A1:D31"},
 }
 
