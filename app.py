@@ -12706,7 +12706,7 @@ def _own_stats_v1_from_official_payload(payload, nickname, server_name, server_i
 PARTY_SHEET_ID = "1TDkZojKWuHNfu5cl1lpuqVZvTKF6W9-c9WLjga8ihIc"
 PARTY_CONFIGS = {
     "무스펠": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I31"},
-    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A1:I31"},
+    "성역3": {"sheet": "파티편성", "gid": "234073660", "range": "A18:I31"},
     "성역4": {"sheet": "성역4", "gid": None, "range": "A1:D31"},
 }
 
@@ -12724,6 +12724,21 @@ def _party_get_config(section_name: str):
         if _party_normalize(name) == key:
             return name, cfg
     return None, None
+
+
+def _party_range_column_count(a1: str, default: int = 5) -> int:
+    """Return the number of columns in an A1 range such as A1:I31."""
+    m = re.fullmatch(r"([A-Za-z]+)\d+:([A-Za-z]+)\d+", str(a1 or "").strip())
+    if not m:
+        return default
+
+    def col_num(letters: str) -> int:
+        n = 0
+        for ch in letters.upper():
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return n
+
+    return max(1, col_num(m.group(2)) - col_num(m.group(1)) + 1)
 
 
 async def _party_fetch_range(cfg):
@@ -12768,8 +12783,8 @@ async def _party_fetch_range(cfg):
             rows = [list(row) for row in csv.reader(io.StringIO(raw))]
             if not rows:
                 raise RuntimeError("Google Sheet 범위 데이터 없음")
-            # The requested range is 5 columns. Preserve blank cells/rows as much as CSV permits.
-            width = 5
+            # Preserve every configured column through the end of the A1 range.
+            width = _party_range_column_count(a1, 5)
             normalized = []
             for row in rows:
                 row = list(row) + [""] * max(0, width - len(row))
@@ -12787,12 +12802,13 @@ def _party_svg(display_name: str, rows):
     if not rows:
         rows = [["데이터 없음", "", "", "", ""]]
 
-    cols = 5
+    # Keep the legacy 5-column minimum, but allow 무스펠/성역3 to extend through I.
+    cols = max(5, max((len(r) for r in rows), default=5))
     rows = [list(r) + [""] * max(0, cols - len(r)) for r in rows]
     rows = [r[:cols] for r in rows]
 
-    # Fixed proportions matching the sheet: party / name / class / power / role.
-    col_widths = [150, 220, 150, 180, 240]
+    # Legacy A:E widths plus extra sheet columns when present.
+    col_widths = ([150, 220, 150, 180, 240] + [180] * max(0, cols - 5))[:cols]
     row_h = 54
     title_h = 70
     margin = 18
@@ -12827,7 +12843,7 @@ def _party_svg(display_name: str, rows):
             value = str(row[c_idx] or "")
             if value:
                 # Keep long role notes readable without breaking the SVG.
-                max_chars = [10, 15, 10, 12, 18][c_idx]
+                max_chars = ([10, 15, 10, 12, 18] + [14] * max(0, cols - 5))[c_idx]
                 shown = value if len(value) <= max_chars else value[:max_chars-1] + "…"
                 out.append(
                     f'<text x="{x + w/2}" y="{y + 34}" text-anchor="middle" font-size="20" font-weight="{weight}" fill="{text_fill}">{sx(shown)}</text>'
@@ -12852,8 +12868,9 @@ async def party_image(section_name: str):
         # Keep the exact configured row count even when trailing rows are blank.
         m = re.fullmatch(r"[A-Za-z]+(\d+):[A-Za-z]+(\d+)", str(cfg.get("range") or "").strip())
         expected_rows = (int(m.group(2)) - int(m.group(1)) + 1) if m else len(rows)
+        render_cols = max(5, _party_range_column_count(str(cfg.get("range") or ""), 5))
         while len(rows) < expected_rows:
-            rows.append(["", "", "", "", ""])
+            rows.append([""] * render_cols)
         rows = rows[:expected_rows]
 
         from PIL import Image, ImageDraw, ImageFont
@@ -12885,8 +12902,10 @@ async def party_image(section_name: str):
         header_font = load_font(21, True)
         body_font = load_font(20, False)
 
-        # Fixed 5-column sheet layout: 파티 / 이름 / 직업 / 전투력 / 비고
-        col_widths = [145, 225, 150, 185, 265]
+        # Keep the existing 5-column layout as the minimum.
+        # 무스펠/성역3 are configured through column I, so render all 9 columns.
+        cols = max(5, _party_range_column_count(str(cfg.get("range") or ""), 5))
+        col_widths = ([145, 225, 150, 185, 265] + [180] * max(0, cols - 5))[:cols]
         row_h = 52
         title_h = 68
         margin = 18
@@ -12899,8 +12918,8 @@ async def party_image(section_name: str):
 
         y0 = title_h
         for r_idx, row in enumerate(rows):
-            row = list(row) + [""] * max(0, 5 - len(row))
-            row = row[:5]
+            row = list(row) + [""] * max(0, cols - len(row))
+            row = row[:cols]
             joined = " ".join(str(x or "") for x in row)
 
             party_header = any(x in joined for x in ("1파티", "2파티", "1공대", "2공대"))
@@ -12923,7 +12942,7 @@ async def party_image(section_name: str):
                 value = str(cell or "").strip()
                 if value:
                     # Keep long notes within the cell.
-                    max_chars = [10, 16, 10, 12, 20][c]
+                    max_chars = ([10, 16, 10, 12, 20] + [14] * max(0, cols - 5))[c]
                     shown = value if len(value) <= max_chars else value[:max_chars - 1] + "…"
                     bbox = draw.textbbox((0, 0), shown, font=font)
                     tw = bbox[2] - bbox[0]
