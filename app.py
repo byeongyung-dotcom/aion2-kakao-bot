@@ -9161,14 +9161,22 @@ async def fetch_board_latest(command: str, limit: int = 5):
 
 NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v3-20260908"
 NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
-# Historical board catch-up is intentionally disabled from this version onward.
-# A fresh delivery cursor is established on deploy/version migration, then only
-# posts published after each board's last successful check are eligible.
-BOARD_DELIVERY_VERSION = "board-fresh-v1-20260915"
-BOARD_PENDING_MAX_AGE_SECONDS = 6 * 60 * 60
+# Resume-safe board delivery. Render's ephemeral /tmp is cleared on deploy, so
+# the server cursor can disappear while the phone's V8 delivery DB remains.
+# On a fresh cursor we recover only a tightly bounded recent window; the phone's
+# existing per-room delivery keys suppress anything it already sent.
+BOARD_DELIVERY_VERSION = "board-resume-v2-20260922"
+BOARD_PENDING_MAX_AGE_SECONDS = 48 * 60 * 60
+BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS = 36 * 60 * 60
+BOARD_RECOVERY_MAX_PER_BOARD = 3
+BOARD_MAX_NEW_PER_CHECK = 10
 BOARD_POST_TIME_GRACE_SECONDS = 90
 BOARD_AUTO_FETCH_TIMEOUT_SECONDS = 11.0
 BOARD_CHECK_MIN_INTERVAL_SECONDS = 20.0
+BOARD_FETCH_HEALTH = {
+    board: {"lastAttemptAt": "", "lastSuccessAt": "", "lastError": ""}
+    for board in ("공지", "CM", "업데이트")
+}
 
 
 def _classify_notice_kind(title):
@@ -9226,6 +9234,58 @@ def _board_post_is_recent(post, now=None, max_hours=36):
         return 0 <= delta_days <= 1
     except Exception:
         return False
+
+
+def _board_alert_item(board, post):
+    """Build one phone/PWA board item after the caller establishes freshness."""
+    if not isinstance(post, dict):
+        return None
+    post_id = str(post.get("id") or "").strip()
+    title = str(post.get("title") or "").strip()
+    if not post_id or not title:
+        return None
+
+    kind = None
+    if board == "공지":
+        kind = _classify_notice_kind(title)
+        if not kind:
+            return None
+
+    card_url = board_card_url(board, post_id)
+    return {
+        # Keep this out of the phone's old "board" text branch. The V8 phone
+        # falls through to item.message and sends the Kakao preview card URL.
+        "type": "board_card",
+        "board": board,
+        "kind": kind,
+        "id": post_id,
+        "title": title,
+        "postedAt": str(post.get("postedAt") or ""),
+        "message": card_url,
+        "cardUrl": card_url,
+        "officialUrl": str(post.get("link") or ""),
+        "key": f"{board}:{post_id}",
+    }
+
+
+def _board_restart_recovery_posts(board, rows, now=None):
+    """Return at most a few recent alertable posts after cursor loss.
+
+    Rows arrive newest-first. We retain only the newest bounded candidates, then
+    return them oldest-first so multiple genuinely missed posts read naturally.
+    """
+    current = now or datetime.now(KST)
+    max_hours = BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS / 3600.0
+    candidates = []
+    for post in rows or []:
+        if not _board_post_is_recent(post, now=current, max_hours=max_hours):
+            continue
+        if _board_alert_item(board, post) is None:
+            continue
+        candidates.append(post)
+        if len(candidates) >= BOARD_RECOVERY_MAX_PER_BOARD:
+            break
+    return list(reversed(candidates))
 
 
 def format_board_latest(command: str, rows):
@@ -9298,7 +9358,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V12 CHARACTER ENDPOINT FIX"
+PWA_APP_VERSION = "V13 BOARD ALERT RESUME FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9972,7 +10032,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-19-character-endpoint-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-22-board-alert-resume-fix"}
 
 
 @app.get("/manifest.webmanifest")
@@ -10955,20 +11015,33 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 due_boards.append(board_name)
 
     async def _fetch_board(board_name):
+        attempted_at = datetime.now(KST).isoformat()
+        health = BOARD_FETCH_HEALTH.setdefault(
+            board_name,
+            {"lastAttemptAt": "", "lastSuccessAt": "", "lastError": ""},
+        )
+        health["lastAttemptAt"] = attempted_at
         try:
             board_limit = 50 if board_name == "공지" else 18
-            return await asyncio.wait_for(
+            rows = await asyncio.wait_for(
                 fetch_board_latest(board_name, limit=board_limit),
                 timeout=BOARD_AUTO_FETCH_TIMEOUT_SECONDS,
             )
-        except Exception:
-            return []
+            health["lastSuccessAt"] = datetime.now(KST).isoformat()
+            health["lastError"] = ""
+            return True, rows
+        except Exception as exc:
+            health["lastError"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+            return False, []
 
     boards = ("공지", "CM", "업데이트")
     latest_by_board = {board: None for board in boards}
     if due_boards:
         results = await asyncio.gather(*[_fetch_board(b) for b in due_boards])
-        latest_by_board.update(dict(zip(due_boards, results)))
+        for board_name, result in zip(due_boards, results):
+            ok, rows = result
+            if ok:
+                latest_by_board[board_name] = rows
 
     async with _openchat_alert_lock:
         state = _load_openchat_alert_state()
@@ -10996,109 +11069,93 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
                 continue
             pending.append(row)
 
-        # One-time delivery migration/reset: discard any historical backlog from
-        # older alert logic and establish the current top posts as a clean cursor.
-        # This prevents redeploy/recovery code from replaying days-old notices.
-        if str(delivery.get("boardDeliveryVersion") or "") != BOARD_DELIVERY_VERSION:
+        # Version migration clears only old pending/leases, not ACK history. Each
+        # board then establishes its own cursor only after that board fetches
+        # successfully. This prevents one transient API failure from silently
+        # marking all three boards initialized.
+        version_reset = str(delivery.get("boardDeliveryVersion") or "") != BOARD_DELIVERY_VERSION
+        if version_reset:
             pending = []
             delivery["boardPending"] = []
             delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
             delivery["boardDeliveryVersion"] = BOARD_DELIVERY_VERSION
-            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
-            for board, rows in latest_by_board.items():
-                if rows:
-                    delivery["lastSeen"][board] = rows[0]["id"]
-                    checked[board] = now.isoformat()
-            delivery["boardCheckedAt"] = checked
-            delivery["initialized"] = True
-            if latest_by_board.get("공지"):
-                delivery["noticeClassifierVersion"] = NOTICE_ALERT_CLASSIFIER_VERSION
-            state.setdefault("deliveries", {})[_openchat_delivery_key(room)] = delivery
-            _save_openchat_alert_state(state)
-            return {
-                "ok": True,
-                "enabled": True,
-                "room": room_key,
-                "baseline": True,
-                "items": [],
+            delivery["lastSeen"] = {"공지": None, "CM": None, "업데이트": None}
+            delivery["boardCheckedAt"] = {"공지": "", "CM": "", "업데이트": ""}
+            leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
+            delivery["leases"] = {
+                str(key): value
+                for key, value in leases.items()
+                if not str(key).startswith(("공지:", "CM:", "업데이트:"))
             }
 
-        if first_run:
-            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
-            for board, rows in latest_by_board.items():
-                if rows:
-                    delivery["lastSeen"][board] = rows[0]["id"]
-                    checked[board] = now.isoformat()
-            delivery["boardCheckedAt"] = checked
-            delivery["initialized"] = True
-        else:
-            known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
-            checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
-            for board, rows in latest_by_board.items():
-                if not rows:
-                    # Do not advance this board's time cursor on a failed/empty fetch.
-                    continue
+        known_pending = {str(x.get("item", {}).get("key") or "") for x in pending}
+        checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
+        for board, rows in latest_by_board.items():
+            # None means this board was not due or its fetch failed. Never move its
+            # cursor/check time in either case; the next phone poll retries it.
+            if rows is None:
+                continue
 
-                previous_id = delivery["lastSeen"].get(board)
-                previous_checked = _parse_kst_iso(checked.get(board))
-                new_rows = []
-                for row in rows:
-                    if previous_id is not None and str(row["id"]) == str(previous_id):
-                        break
-                    new_rows.append(row)
+            previous_id = delivery["lastSeen"].get(board)
+            previous_checked = _parse_kst_iso(checked.get(board))
 
-                delivery["lastSeen"][board] = rows[0]["id"]
-                checked[board] = now.isoformat()
-
-                for post in reversed(new_rows):
-                    posted = _parse_board_post_datetime(post.get("postedAt"))
-                    # ID changes alone are never enough to replay historical rows.
-                    # A post must have been published after this board's last
-                    # successful check (with a small clock/API ordering grace).
-                    if previous_checked is None or posted is None:
+            # Per-board first successful fetch after deploy/restart. Recover only
+            # a few alertable posts from the bounded recent window. Older history
+            # is discarded, and the phone's persistent V8 delivery DB suppresses
+            # any of these keys that were already delivered before the restart.
+            if previous_id is None or previous_checked is None:
+                recovery_rows = _board_restart_recovery_posts(board, rows, now=now)
+                for post in recovery_rows:
+                    item = _board_alert_item(board, post)
+                    key = str((item or {}).get("key") or "")
+                    if not item or not key or key in known_pending:
                         continue
-                    if posted < previous_checked - timedelta(seconds=BOARD_POST_TIME_GRACE_SECONDS):
-                        continue
-                    if (now - posted).total_seconds() > BOARD_PENDING_MAX_AGE_SECONDS:
-                        continue
-
-                    kind = None
-                    if board == "공지":
-                        kind = _classify_notice_kind(post.get("title") or "")
-                        if not kind:
-                            continue
-                    key = f"{board}:{post['id']}"
-                    if key in known_pending:
-                        continue
-                    card_url = board_card_url(board, post["id"])
-                    item = {
-                        # Keep this out of the phone's old "board" text branch.
-                        # The V8 phone code falls through to item.message and sends the card URL.
-                        "type": "board_card",
-                        "board": board,
-                        "kind": kind,
-                        "id": post["id"],
-                        "title": post["title"],
-                        "postedAt": str(post.get("postedAt") or ""),
-                        "message": card_url,
-                        "cardUrl": card_url,
-                        "officialUrl": str(post.get("link") or ""),
-                        "key": key,
-                    }
                     pending.append({"created": now_epoch, "item": item})
                     known_pending.add(key)
+                if rows:
+                    delivery["lastSeen"][board] = rows[0]["id"]
+                checked[board] = now.isoformat()
+                continue
 
-            delivery["boardCheckedAt"] = checked
+            new_rows = []
+            for row in rows:
+                if str(row.get("id") or "") == str(previous_id):
+                    break
+                new_rows.append(row)
+                if len(new_rows) >= BOARD_MAX_NEW_PER_CHECK:
+                    break
 
-        # Historical classifier-recovery is intentionally disabled. It previously
-        # searched up to 36 hours back and could replay an old maintenance/live
-        # notice after a deploy or state migration.
+            if rows:
+                delivery["lastSeen"][board] = rows[0]["id"]
+            checked[board] = now.isoformat()
+
+            for post in reversed(new_rows):
+                posted = _parse_board_post_datetime(post.get("postedAt"))
+                # ID changes alone are never enough to replay historical rows.
+                # The timestamp must be newer than the last successful check.
+                if posted is None:
+                    continue
+                if posted < previous_checked - timedelta(seconds=BOARD_POST_TIME_GRACE_SECONDS):
+                    continue
+                if (now - posted).total_seconds() > BOARD_PENDING_MAX_AGE_SECONDS:
+                    continue
+                item = _board_alert_item(board, post)
+                key = str((item or {}).get("key") or "")
+                if not item or not key or key in known_pending:
+                    continue
+                pending.append({"created": now_epoch, "item": item})
+                known_pending.add(key)
+
+        delivery["boardCheckedAt"] = checked
+        delivery["initialized"] = True
+
+        # The old unbounded 36-hour replay path remains removed. The new resume
+        # path above is capped per board and runs only when that board has no
+        # usable cursor after restart/version migration.
         delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
 
-        # Legacy 36-hour classifier recovery removed in BOARD_DELIVERY_VERSION.
-        # Record the classifier version only when the notice source was actually fetched.
-        # This is diagnostic only; recovery completion itself is ACK-gated above.
-        if latest_by_board.get("공지"):
+        # Record the classifier version only when the notice source was fetched.
+        if latest_by_board.get("공지") is not None:
             delivery["noticeClassifierVersion"] = NOTICE_ALERT_CLASSIFIER_VERSION
 
         delivery["boardPending"] = pending[-100:]
@@ -11134,7 +11191,7 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             "ok": True,
             "enabled": True,
             "room": room_key,
-            "baseline": first_run,
+            "baseline": bool(first_run or version_reset),
             "items": board_items,
         }
 
@@ -11207,11 +11264,20 @@ async def kakao_bridge_status():
             "lastPollAgeSeconds": round(age, 1) if age is not None else None,
             "lastPollAt": last.strftime("%H:%M:%S") if last is not None else "",
             "lastAckAt": str(d.get("lastAckAt") or ""),
+            "boardPending": len(d.get("boardPending") or []),
+            "boardLastSeen": dict(d.get("lastSeen") or {}),
+            "boardCheckedAt": dict(d.get("boardCheckedAt") or {}),
         })
     room_states.sort(key=lambda x: (not x["active"], x["alias"]))
     return {"ok": True, "version": PWA_APP_VERSION, "rooms": len(room_states),
             "activeRooms": sum(1 for x in room_states if x["active"]),
-            "defaultLeads": list(DEFAULT_SCHEDULE_ALERT_LEADS), "roomStates": room_states[:30]}
+            "defaultLeads": list(DEFAULT_SCHEDULE_ALERT_LEADS),
+            "boardDeliveryVersion": BOARD_DELIVERY_VERSION,
+            "boardFetchHealth": {
+                board: dict(BOARD_FETCH_HEALTH.get(board) or {})
+                for board in ("공지", "CM", "업데이트")
+            },
+            "roomStates": room_states[:30]}
 
 
 # =========================================================
@@ -13231,15 +13297,29 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
         leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
         active_leases = {str(k): max(0, int(float(v) - now_epoch)) for k, v in leases.items() if _alert_float(v, 0.0) > now_epoch}
         sent_count = len([x for x in (delivery.get("sentKeys") or []) if str(x)])
+        board_pending = [
+            x for x in (delivery.get("boardPending") or [])
+            if isinstance(x, dict) and isinstance(x.get("item"), dict)
+        ]
         lines = [
             "🧪 자동알림 큐 진단",
             "",
             f"방: {display_room or _openchat_room_key(room) or '(미확인)'}",
             f"테스트 대기: {len(tests)}개",
+            f"게시판 대기: {len(board_pending)}개",
             f"활성 lease: {len(active_leases)}개",
             f"ACK 완료 누적: {sent_count}개",
             f"마지막 폴링: {str(delivery.get('lastPollAt') or '없음')}",
         ]
+        checked = delivery.get("boardCheckedAt") if isinstance(delivery.get("boardCheckedAt"), dict) else {}
+        seen = delivery.get("lastSeen") if isinstance(delivery.get("lastSeen"), dict) else {}
+        for board_name in ("공지", "CM", "업데이트"):
+            health = BOARD_FETCH_HEALTH.get(board_name) or {}
+            status = "오류" if str(health.get("lastError") or "") else "정상"
+            lines.append(
+                f"{board_name}: {status} / ID {str(seen.get(board_name) or '-')} / "
+                f"확인 {str(checked.get(board_name) or '없음')}"
+            )
         if tests:
             newest = tests[-1]
             lines.append(f"최근 테스트: {str(newest.get('scenario') or 'generic')} / {str(newest.get('key') or '')[-18:]}")
