@@ -9165,7 +9165,7 @@ NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
 # the server cursor can disappear while the phone's V8 delivery DB remains.
 # On a fresh cursor we recover only a tightly bounded recent window; the phone's
 # existing per-room delivery keys suppress anything it already sent.
-BOARD_DELIVERY_VERSION = "board-resume-v2-20260922"
+BOARD_DELIVERY_VERSION = "board-resume-v3-card-text-20260922"
 BOARD_PENDING_MAX_AGE_SECONDS = 48 * 60 * 60
 BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS = 36 * 60 * 60
 BOARD_RECOVERY_MAX_PER_BOARD = 3
@@ -9252,19 +9252,35 @@ def _board_alert_item(board, post):
             return None
 
     card_url = board_card_url(board, post_id)
+    label = board_card_label(board, title)
+    message = "\n".join([
+        label,
+        "",
+        title,
+        "",
+        "🔗 바로 보기",
+        card_url,
+    ])
+    # The old phone marked the URL-only CM/update item as sent as soon as the
+    # MessengerBotR room session existed. Give the corrected text-card transport
+    # its own delivery key so the latest genuinely recent CM/update can be
+    # recovered once after this deploy without replaying notice history.
+    delivery_key = f"{board}:{post_id}"
+    if board in ("CM", "업데이트"):
+        delivery_key += "|card-text-v2"
     return {
-        # Keep this out of the phone's old "board" text branch. The V8 phone
-        # falls through to item.message and sends the Kakao preview card URL.
+        # Keep board_card for Kakao link preview, but include visible board/title
+        # text instead of relying on a bare URL as the whole notification.
         "type": "board_card",
         "board": board,
         "kind": kind,
         "id": post_id,
         "title": title,
         "postedAt": str(post.get("postedAt") or ""),
-        "message": card_url,
+        "message": message,
         "cardUrl": card_url,
         "officialUrl": str(post.get("link") or ""),
-        "key": f"{board}:{post_id}",
+        "key": delivery_key,
     }
 
 
@@ -9358,7 +9374,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V13 BOARD ALERT RESUME FIX"
+PWA_APP_VERSION = "V14 CM UPDATE CARD ALERT FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10032,7 +10048,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-22-board-alert-resume-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-22-cm-update-card-alert-fix"}
 
 
 @app.get("/manifest.webmanifest")
