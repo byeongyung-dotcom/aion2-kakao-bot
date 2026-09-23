@@ -9126,7 +9126,18 @@ async def fetch_board_latest(command: str, limit: int = 5):
         content_id = snow.get("contentId") or item.get("contentId") or item.get("articleId")
         title = str(item.get("title") or "").strip()
         timestamps = item.get("timestamps") or {}
-        posted = timestamps.get("postDateTime") or item.get("postDateTime") or ""
+        # PlayNC's plain postDateTime field is UTC but carries no timezone.
+        # Prefer the explicit UTC ISO/epoch fields so a newly published post is
+        # not mistaken for a nine-hour-old item and discarded after lastSeen
+        # has already advanced.
+        posted = (
+            timestamps.get("postedAt")
+            or timestamps.get("publishedAt")
+            or timestamps.get("postedEpoch")
+            or timestamps.get("postDateTime")
+            or item.get("postDateTime")
+            or ""
+        )
 
         if not content_id or not title:
             continue
@@ -9165,7 +9176,7 @@ NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
 # the server cursor can disappear while the phone's V8 delivery DB remains.
 # On a fresh cursor we recover only a tightly bounded recent window; the phone's
 # existing per-room delivery keys suppress anything it already sent.
-BOARD_DELIVERY_VERSION = "board-resume-v4-phone-sequential-20260923"
+BOARD_DELIVERY_VERSION = "board-resume-v5-utc-timestamp-20260924"
 BOARD_PENDING_MAX_AGE_SECONDS = 48 * 60 * 60
 BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS = 36 * 60 * 60
 BOARD_RECOVERY_MAX_PER_BOARD = 3
@@ -9186,7 +9197,8 @@ def _classify_notice_kind(title):
     compact = re.sub(r"[^0-9a-z가-힣]+", "", lowered)
 
     # Maintenance has priority if a title contains both kinds of words.
-    if "점검" in title_text or "maintenance" in lowered:
+    maintenance_title = title_text.replace("무점검", "")
+    if "점검" in maintenance_title or "maintenance" in lowered:
         return "maintenance"
 
     live_markers = (
@@ -9271,7 +9283,7 @@ def _board_alert_item(board, post):
     # V8.3.10 acknowledged several board cards after MessengerBotR accepted the
     # room session but before the Kakao message became visible. A new transport
     # suffix lets V8.3.11 recover only the bounded recent board window once.
-    delivery_key += "|phone-seq-v1"
+    delivery_key += "|phone-seq-v1|utc-time-v1"
     return {
         # Keep board_card for Kakao link preview, but include visible board/title
         # text instead of relying on a bare URL as the whole notification.
@@ -9295,7 +9307,11 @@ def _board_restart_recovery_posts(board, rows, now=None):
     return them oldest-first so multiple genuinely missed posts read naturally.
     """
     current = now or datetime.now(KST)
-    max_hours = BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS / 3600.0
+    # Notices are more time-sensitive and can be numerous. Recover only the
+    # current few hours so yesterday's completed maintenance is never replayed.
+    # CM/update keep the existing bounded 36-hour window because those boards
+    # publish less often and the timestamp bug could have skipped their latest.
+    max_hours = 6.0 if board == "공지" else BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS / 3600.0
     candidates = []
     for post in rows or []:
         if not _board_post_is_recent(post, now=current, max_hours=max_hours):
@@ -9378,7 +9394,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V15 BOARD ALERT SEQUENTIAL FIX"
+PWA_APP_VERSION = "V16 BOARD UTC TIME FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10052,7 +10068,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-23-board-alert-sequential-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-24-board-utc-time-fix"}
 
 
 @app.get("/manifest.webmanifest")
