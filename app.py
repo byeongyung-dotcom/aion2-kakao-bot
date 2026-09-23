@@ -9165,7 +9165,7 @@ NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
 # the server cursor can disappear while the phone's V8 delivery DB remains.
 # On a fresh cursor we recover only a tightly bounded recent window; the phone's
 # existing per-room delivery keys suppress anything it already sent.
-BOARD_DELIVERY_VERSION = "board-resume-v3-card-text-20260922"
+BOARD_DELIVERY_VERSION = "board-resume-v4-phone-sequential-20260923"
 BOARD_PENDING_MAX_AGE_SECONDS = 48 * 60 * 60
 BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS = 36 * 60 * 60
 BOARD_RECOVERY_MAX_PER_BOARD = 3
@@ -9268,6 +9268,10 @@ def _board_alert_item(board, post):
     delivery_key = f"{board}:{post_id}"
     if board in ("CM", "업데이트"):
         delivery_key += "|card-text-v2"
+    # V8.3.10 acknowledged several board cards after MessengerBotR accepted the
+    # room session but before the Kakao message became visible. A new transport
+    # suffix lets V8.3.11 recover only the bounded recent board window once.
+    delivery_key += "|phone-seq-v1"
     return {
         # Keep board_card for Kakao link preview, but include visible board/title
         # text instead of relying on a bare URL as the whole notification.
@@ -9374,7 +9378,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V14 CM UPDATE CARD ALERT FIX"
+PWA_APP_VERSION = "V15 BOARD ALERT SEQUENTIAL FIX"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10048,7 +10052,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-22-cm-update-card-alert-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-23-board-alert-sequential-fix"}
 
 
 @app.get("/manifest.webmanifest")
