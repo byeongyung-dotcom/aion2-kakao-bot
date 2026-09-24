@@ -9172,11 +9172,9 @@ async def fetch_board_latest(command: str, limit: int = 5):
 
 NOTICE_ALERT_CLASSIFIER_VERSION = "notice-v3-20260908"
 NOTICE_RECOVERY_VERSION = "notice-recovery-v3-20260908"
-# Resume-safe board delivery. Render's ephemeral /tmp is cleared on deploy, so
-# the server cursor can disappear while the phone's V8 delivery DB remains.
-# On a fresh cursor we recover only a tightly bounded recent window; the phone's
-# existing per-room delivery keys suppress anything it already sent.
-BOARD_DELIVERY_VERSION = "board-resume-v5-utc-timestamp-20260924"
+# Fresh-only board delivery. A deploy/restart establishes the current board
+# heads as the baseline and never replays posts that already existed.
+BOARD_DELIVERY_VERSION = "board-fresh-only-v6-20260924"
 BOARD_PENDING_MAX_AGE_SECONDS = 48 * 60 * 60
 BOARD_RESTART_RECOVERY_MAX_AGE_SECONDS = 36 * 60 * 60
 BOARD_RECOVERY_MAX_PER_BOARD = 3
@@ -9394,7 +9392,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V16 BOARD UTC TIME FIX"
+PWA_APP_VERSION = "V17 BOARD FRESH ONLY"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10068,7 +10066,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-24-board-utc-time-fix"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-24-board-fresh-only"}
 
 
 @app.get("/manifest.webmanifest")
@@ -10778,6 +10776,29 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             return {"ok": True, "enabled": False, "room": room_key, "baseline": False, "items": []}
 
         _, delivery = _openchat_get_delivery(state, room)
+
+        # A deploy/version change is a fresh-only boundary. Drop every board
+        # item discovered by the previous build before the fast path can expose
+        # it to the phone. The deployment time becomes the cutoff: posts that
+        # already existed are baseline only, while posts published afterwards
+        # are still eligible on the first successful board fetch.
+        if str(delivery.get("boardDeliveryVersion") or "") != BOARD_DELIVERY_VERSION:
+            delivery["boardPending"] = []
+            delivery["boardDeliveryVersion"] = BOARD_DELIVERY_VERSION
+            delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
+            delivery["lastSeen"] = {"공지": None, "CM": None, "업데이트": None}
+            delivery["boardCheckedAt"] = {
+                "공지": now.isoformat(),
+                "CM": now.isoformat(),
+                "업데이트": now.isoformat(),
+            }
+            old_leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
+            delivery["leases"] = {
+                str(key): value
+                for key, value in old_leases.items()
+                if not str(key).startswith(("공지:", "CM:", "업데이트:"))
+            }
+
         delivery["lastPollAt"] = now.isoformat()
         delivery["lastAlias"] = _openchat_room_key(room_alias) or room_key
         first_run = not delivery.get("initialized")
@@ -11116,7 +11137,11 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
             delivery["boardDeliveryVersion"] = BOARD_DELIVERY_VERSION
             delivery["lastSeen"] = {"공지": None, "CM": None, "업데이트": None}
-            delivery["boardCheckedAt"] = {"공지": "", "CM": "", "업데이트": ""}
+            delivery["boardCheckedAt"] = {
+                "공지": now.isoformat(),
+                "CM": now.isoformat(),
+                "업데이트": now.isoformat(),
+            }
             leases = delivery.get("leases") if isinstance(delivery.get("leases"), dict) else {}
             delivery["leases"] = {
                 str(key): value
@@ -11135,19 +11160,28 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
             previous_id = delivery["lastSeen"].get(board)
             previous_checked = _parse_kst_iso(checked.get(board))
 
-            # Per-board first successful fetch after deploy/restart. Recover only
-            # a few alertable posts from the bounded recent window. Older history
-            # is discarded, and the phone's persistent V8 delivery DB suppresses
-            # any of these keys that were already delivered before the restart.
-            if previous_id is None or previous_checked is None:
-                recovery_rows = _board_restart_recovery_posts(board, rows, now=now)
-                for post in recovery_rows:
-                    item = _board_alert_item(board, post)
-                    key = str((item or {}).get("key") or "")
-                    if not item or not key or key in known_pending:
-                        continue
-                    pending.append({"created": now_epoch, "item": item})
-                    known_pending.add(key)
+            # First successful fetch establishes the baseline. Never replay
+            # posts that existed before a deploy/restart. If a post was published
+            # after the recorded deployment cutoff but before this fetch, keep it
+            # so a genuinely new post is not lost during the short startup gap.
+            if previous_id is None:
+                if previous_checked is not None:
+                    for post in reversed(rows):
+                        posted = _parse_board_post_datetime(post.get("postedAt"))
+                        if posted is None or posted <= previous_checked:
+                            continue
+                        item = _board_alert_item(board, post)
+                        key = str((item or {}).get("key") or "")
+                        if not item or not key or key in known_pending:
+                            continue
+                        pending.append({"created": now_epoch, "item": item})
+                        known_pending.add(key)
+                if rows:
+                    delivery["lastSeen"][board] = rows[0]["id"]
+                checked[board] = now.isoformat()
+                continue
+
+            if previous_checked is None:
                 if rows:
                     delivery["lastSeen"][board] = rows[0]["id"]
                 checked[board] = now.isoformat()
@@ -11185,9 +11219,8 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
         delivery["boardCheckedAt"] = checked
         delivery["initialized"] = True
 
-        # The old unbounded 36-hour replay path remains removed. The new resume
-        # path above is capped per board and runs only when that board has no
-        # usable cursor after restart/version migration.
+        # Recovery replay stays disabled. Restart/version migration only records
+        # a fresh baseline; delivery begins with posts newer than that cutoff.
         delivery["noticeRecoveryVersion"] = NOTICE_RECOVERY_VERSION
 
         # Record the classifier version only when the notice source was fetched.
