@@ -7043,10 +7043,10 @@ DEFAULT_BOSS_RULES = {
     "kairaHours": [1, 5, 9, 13, 17, 21],
     "nahmaWeekdays": [4, 6],     # Fri / Sun
     "nahmaHour": 22,
-    "nahmaMinute": 0,
+    "nahmaMinute": 30,
     "abyssWeekdays": [2, 5],     # Wed / Sat
     "abyssHour": 22,
-    "abyssMinute": 30,
+    "abyssMinute": 15,
     "agroIntervalHours": 12,
     # Weekly timetable additions from the supplied table.
     "sigongWeekdays": [0, 3, 5],       # Mon / Thu / Sat
@@ -7054,10 +7054,13 @@ DEFAULT_BOSS_RULES = {
     "gyunyeolWeekdays": [1, 3],        # Tue / Thu
     "gyunyeolTimes": [(22, 0)],
     "atiWeekdays": [2, 5],             # Wed / Sat
-    "atiTimes": [(22, 0)],
+    "atiTimes": [(21, 50)],
     "fieldBossWeekdays": [2, 5],       # Wed / Sat
-    "fieldBossTimes": [(22, 30)],
+    "fieldBossTimes": [(22, 15)],
 }
+
+# 9/30 maintenance onward: Zikel belongs to official group 2.
+PUBLISHED_SCHEDULE_VERSION = "zikel-group2-20260930-v1"
 
 BOSS_RULES = dict(DEFAULT_BOSS_RULES)
 BOSS_RULES_META = {
@@ -8012,6 +8015,16 @@ def _next_weekly_multi(weekdays, times, now=None):
 def _apply_manual_schedule_overrides():
     data = _load_boss_schedule_overrides()
 
+    # The official 9/30 timetable supersedes old saved corrections for only the
+    # affected Zikel schedules. Record the migration once; later user-entered
+    # manual corrections continue to work normally.
+    if str(data.get("publishedScheduleVersion") or "") != PUBLISHED_SCHEDULE_VERSION:
+        for stale_key in ("nahma", "abyss", "ati", "fieldboss"):
+            data.pop(stale_key, None)
+        data["publishedScheduleVersion"] = PUBLISHED_SCHEDULE_VERSION
+        data["publishedScheduleUpdatedAt"] = datetime.now(KST).isoformat()
+        _save_boss_schedule_overrides(data)
+
     kaira = data.get("kaira") or {}
     if isinstance(kaira.get("hours"), list) and kaira["hours"]:
         BOSS_RULES["kairaHours"] = sorted(set(int(x) % 24 for x in kaira["hours"]))
@@ -8131,8 +8144,9 @@ def _bind_or_rebase_maintenance_schedules(old_anchor, new_anchor, source_id, sou
     Current published clocks are fixed by weekday/time:
     - Sigong domination: Mon/Thu/Sat 20:00, 23:00
     - Abyss Rift Zone: Tue/Thu 22:00
-    - Artifact occupation: Wed/Sat 22:00
-    - Abyss/field boss: Wed/Sat 22:30
+    - Artifact occupation (Zikel/group 2): Wed/Sat 21:50
+    - Abyss/field boss (Zikel/group 2): Wed/Sat 22:15
+    - Nahma (Zikel/group 2): Fri/Sun 22:30
 
     Earlier bot versions incorrectly shifted these clocks whenever maintenance
     ended later/earlier.  That made alerts fire at 20:30 instead of 20:00 after
@@ -9392,7 +9406,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V17 BOARD FRESH ONLY"
+PWA_APP_VERSION = "V18 ZIKEL GROUP2 SINGLE CARD"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10066,7 +10080,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-24-board-fresh-only"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-29-zikel-group2-single-card"}
 
 
 @app.get("/manifest.webmanifest")
