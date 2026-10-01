@@ -5881,13 +5881,13 @@ async def api_compare_character(nickname: str, server: str):
         # detailed_character_data() resolver, which can return characterId not found.
         data = await compare_character_data_db_first(nickname, server)
         return {
-            "version": "v76-priority-equipment-align",
+            "version": "v77-official-outage-fallback",
             **data,
         }
     except Exception as e:
         return {
             "ok": False,
-            "version": "v76-priority-equipment-align",
+            "version": "v77-official-outage-fallback",
             "error": f"{type(e).__name__}: {str(e)[:400]}",
         }
 
@@ -6315,8 +6315,9 @@ async def compare_character_data_db_first(nickname: str, server_name: str):
     if isinstance(official, dict) and official.get("ok"):
         return official
 
-    # If NC is temporarily rate-limiting us, serve the most recent successful
-    # official snapshot regardless of age instead of breaking the compare page.
+    # If NC is temporarily rate-limiting/blocking us, serve the most recent
+    # successful official snapshot regardless of age instead of breaking the
+    # compare page.
     stale = await character_db_get_official_compare(nickname, server_name, max_age_seconds=None)
     if isinstance(stale, dict) and stale.get("ok"):
         stale = dict(stale)
@@ -6324,7 +6325,12 @@ async def compare_character_data_db_first(nickname: str, server_name: str):
         health["cache"] = "persistent-stale-fallback"
         stale["dataHealth"] = health
         return stale
-    return {"ok": False, "error": (official or {}).get("error") or f"{nickname}[{server_name}] NC 공식 데이터 조회 실패"}
+
+    # The official equipment endpoint can return 403/404 during an NC-side
+    # outage even though character search still works.  Only in that failure
+    # case, continue into the already-existing saved/full-profile compare path
+    # below.  This keeps /compare usable without changing normal character
+    # search, cards, alerts, schedules, or any phone-side behavior.
 
     db_row, full_profile = await character_db_get_full_profile(nickname, server_name)
 
@@ -6447,6 +6453,7 @@ async def compare_character_data_db_first(nickname: str, server_name: str):
     return {
         "ok": True,
         "profileAvailable": True,
+        "source": ["saved-full-profile-fallback"],
         "info": full_info,
         "equipment": equipment,
         "magicStoneTotals": stones,
@@ -6459,6 +6466,8 @@ async def compare_character_data_db_first(nickname: str, server_name: str):
         "rankings": rankings,
         "dataHealth": {
             "profileAvailable": True,
+            "cache": "saved-full-profile-fallback",
+            "source": "saved-full-profile-fallback",
             "equipmentCount": len(equipment),
             "stoneGroupCount": len(stones),
             "statCount": len(stats),
@@ -6489,7 +6498,7 @@ async def api_compare(
             return JSONResponse(
                 {
                     "ok": False,
-                    "version": "v75-ui-requested-final",
+                    "version": "v77-official-outage-fallback",
                     "message": " / ".join(messages) or "비교 데이터 준비 실패",
                     "a": a,
                     "b": b,
@@ -6505,7 +6514,7 @@ async def api_compare(
 
         return {
             "ok": True,
-            "version": "v75-ui-requested-final",
+            "version": "v77-official-outage-fallback",
             "a": a,
             "b": b,
             "proAnalysis": pro_analysis,
