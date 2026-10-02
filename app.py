@@ -380,27 +380,74 @@ def _collect_stone_lists(node, out, depth=0):
             if isinstance(value, (dict, list)):
                 _collect_stone_lists(value, out, depth + 1)
 
+
+MAGIC_STONE_LIST_KEYS = (
+    "magicStoneStat", "magicStones", "magicStoneList", "manastones",
+)
+
+
+def _authoritative_magic_stone_lists(profile_json):
+    """Return one equipped-item source instead of summing duplicate snapshots.
+
+    Saved character payloads can contain the same equipment under itemDetails,
+    equipment, and nested response copies.  A profile-wide recursive walk counts
+    those copies more than once.  itemDetails is the detailed equipped source used
+    by the character card, so prefer it and only fall back to recursive discovery
+    when that source is absent.
+    """
+    if not isinstance(profile_json, dict):
+        return []
+
+    def direct_lists(collection):
+        found = []
+        if isinstance(collection, dict):
+            items = list(collection.values())
+        elif isinstance(collection, list):
+            items = collection
+        else:
+            return found
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in MAGIC_STONE_LIST_KEYS:
+                stones = item.get(key)
+                if isinstance(stones, list) and stones:
+                    found.append(stones)
+        return found
+
+    # NC/NotMeter detailed profiles expose the actually equipped items here.
+    for owner in (profile_json, profile_json.get("info")):
+        if not isinstance(owner, dict):
+            continue
+        stone_lists = direct_lists(owner.get("itemDetails"))
+        if stone_lists:
+            return stone_lists
+
+    # Older stored payloads may use one of these equipment containers.  Pick the
+    # single richest container; adding all of them recreates the duplication bug.
+    candidates = []
+    for owner in (profile_json, profile_json.get("info")):
+        if not isinstance(owner, dict):
+            continue
+        for key in (
+            "equipment", "equipments", "equipmentList", "equippedItems",
+            "equipItemList", "items", "gear", "gears",
+        ):
+            lists = direct_lists(owner.get(key))
+            if lists:
+                candidates.append(lists)
+    if candidates:
+        return max(candidates, key=lambda rows: sum(len(x) for x in rows))
+
+    stone_lists = []
+    _collect_stone_lists(profile_json, stone_lists)
+    return stone_lists
+
 def aggregate_magic_stones(profile_json):
     totals = defaultdict(float)
     ids_by_name = {}
-    stone_lists = []
-
-    item_details = profile_json.get("itemDetails")
-    if isinstance(item_details, dict):
-        for item in item_details.values():
-            if isinstance(item, dict):
-                stones = item.get("magicStoneStat")
-                if isinstance(stones, list):
-                    stone_lists.append(stones)
-    elif isinstance(item_details, list):
-        for item in item_details:
-            if isinstance(item, dict):
-                stones = item.get("magicStoneStat")
-                if isinstance(stones, list):
-                    stone_lists.append(stones)
-
-    if not stone_lists:
-        _collect_stone_lists(profile_json, stone_lists)
+    stone_lists = _authoritative_magic_stone_lists(profile_json)
 
     # Deduplicate by content instead of Python object identity.
     seen = set()
@@ -410,7 +457,12 @@ def aggregate_magic_stones(profile_json):
                 continue
             stat_id = str(stone.get("id") or "").strip()
             name = str(stone.get("name") or "").strip()
-            value_raw = str(stone.get("value") or "").strip()
+            value_raw = stone.get("displayValue")
+            if value_raw is None:
+                value_raw = stone.get("value")
+            if value_raw is None:
+                value_raw = stone.get("statValue")
+            value_raw = str(value_raw or "").strip()
             key = (stat_id, name, value_raw, str(stone.get("icon") or ""))
             if not name:
                 continue
@@ -1206,6 +1258,7 @@ def _db_resolved_from_infos(infos):
                 "className": info.get("job"),
                 "combatPower": info.get("combatPower"),
                 "characterLevel": info.get("level"),
+                "profileImage": info.get("profileImage"),
             },
             "profile": {},
             "info": info,
@@ -1225,6 +1278,7 @@ def _db_resolved_from_infos(infos):
                     "className": info.get("job"),
                     "combatPower": info.get("combatPower"),
                     "characterLevel": info.get("level"),
+                    "profileImage": info.get("profileImage"),
                 },
                 "info": info,
             }
@@ -1653,66 +1707,20 @@ async def own_resolve_character(nickname, server_name=None):
     if not nickname:
         return {"type": "none"}
 
-    # 0) Persistent exact identity first.  If the DB knows the characterId, a
-    # temporary NC detail outage must not make the character disappear.
-    if server_name:
-        sid = SERVER_ID_MAP.get(server_name)
-        if sid:
-            try:
-                db_rows = await character_db_get(nickname, server_name)
-                for db_row in (db_rows or []):
-                    cid = str(db_row.get("characterId") or db_row.get("character_id") or "").strip()
-                    if not cid:
-                        continue
-                    row = {
-                        "name": str(db_row.get("name") or nickname),
-                        "serverName": str(
-                            db_row.get("serverName")
-                            or db_row.get("server_name")
-                            or db_row.get("server")
-                            or server_name
-                        ),
-                        "serverId": int(sid),
-                        "characterId": cid,
-                        "className": str(db_row.get("job") or db_row.get("className") or ""),
-                        "combatPower": int(db_row.get("combatPower") or db_row.get("combat_power") or 0),
-                        "characterLevel": int(db_row.get("level") or db_row.get("characterLevel") or 0),
-                    }
-                    # Start with the saved identity; enrich if NC answers quickly.
-                    info = profile_info({}, nickname, server_name, row)
-                    info["characterId"] = cid
-                    try:
-                        detail = await _official_get_json_live(
-                            OFFICIAL_CHARACTER_INFO_API,
-                            params={"lang": "ko", "characterId": cid, "serverId": int(sid)},
-                            timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
-                        )
-                        enriched = _official_info_from_live_data(row, detail)
-                        if str(enriched.get("name") or "").casefold() == nickname.casefold():
-                            info = enriched
-                            # Persist the successful enrichment.  The previous code
-                            # returned the fresh CP/job to this one request but left
-                            # the DB at CP=0 / job="확인 실패", so the card loaded
-                            # immediately afterwards from the stale identity row.
-                            try:
-                                await character_db_upsert(
-                                    info,
-                                    character_id=cid,
-                                    source="plaync-official",
-                                )
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    return {
-                        "type": "detail",
-                        "row": row,
-                        "profile": {},
-                        "info": info,
-                        "stones": [],
-                    }
-            except Exception:
-                pass
+    # 0) Return a saved identity immediately.  NC's detail endpoint can take
+    # 15~25 seconds to fail during an outage; waiting for it made every known
+    # character search feel broken.  Refresh the same character in the existing
+    # background warmer so the fast response never blocks on an external API.
+    try:
+        db_infos = await character_db_get(nickname, server_name)
+    except Exception:
+        db_infos = []
+    if db_infos:
+        resolved = _db_resolved_from_infos(db_infos)
+        resolved["freshIdentityOnly"] = True
+        if resolved.get("type") == "detail":
+            _start_character_detail_warm(resolved.get("row") or {}, nickname)
+        return resolved
 
     # 1) Race the official search with the current NotMeter character endpoint.
     # The retired NotMeter host returned 502, while running these sequentially
@@ -2948,12 +2956,6 @@ async def debug_official_equipped_stats_v2(nickname: str = '윤이', server: str
 def _official_magic_stone_totals(src):
     """Single source of truth for NC official equipped magic-stone totals."""
     groups = {}
-    pct_ids = {
-        "AmplifyWeaponDamage", "AmplifyAllDamage",
-        "PvEAmplifyDamage", "AmplifyBossDamage",
-        "AmplifyCriticalDamage", "AmplifyBackAttack",
-        "AmplifyFrontAttack",
-    }
     for item in (src or {}).get("items") or []:
         if not isinstance(item, dict) or not item.get("ok"):
             continue
@@ -2968,13 +2970,17 @@ def _official_magic_stone_totals(src):
             )
             if not name:
                 continue
-            raw = str(ms.get("value") or "").replace("+", "").replace(",", "").strip()
-            try:
-                value = float(raw.replace("%", ""))
-            except Exception:
+            raw_value = ms.get("displayValue")
+            if raw_value is None:
+                raw_value = ms.get("value")
+            if raw_value is None:
+                raw_value = ms.get("statValue")
+            value = _safe_num(raw_value)
+            if value is None:
                 continue
-            if stat_id in pct_ids and "%" not in raw:
-                value /= 100.0
+            value = _normalize_percent_internal(
+                name, value, raw_value, stat_id or ms.get("name") or ""
+            )
             g = groups.setdefault(name, {"name": name, "count": 0, "total": 0.0})
             g["count"] += 1
             g["total"] += value
@@ -3876,8 +3882,7 @@ def _stone_totals_from_profile(profile):
     if not isinstance(profile, dict):
         return []
 
-    stone_lists = []
-    _collect_stone_lists(profile, stone_lists)
+    stone_lists = _authoritative_magic_stone_lists(profile)
 
     totals = {}
     counts = {}
@@ -3893,7 +3898,11 @@ def _stone_totals_from_profile(profile):
             name = str(
                 stone.get("name") or stone.get("statName") or stone.get("optionName") or ""
             ).strip()
-            canonical = _canonical_offense_name(name) or _canonical_from_stat_id(sid)
+            canonical = (
+                _canonical_offense_name(name)
+                or _canonical_from_stat_id(sid)
+                or name
+            )
             if not canonical:
                 continue
 
@@ -3911,7 +3920,9 @@ def _stone_totals_from_profile(profile):
                 ids[canonical] = sid
 
     rows = []
-    for canonical in OFFENSE_CANONICAL_GROUPS.keys():
+    ordered_names = list(OFFENSE_CANONICAL_GROUPS.keys())
+    ordered_names.extend(sorted(name for name in totals if name not in OFFENSE_CANONICAL_GROUPS))
+    for canonical in ordered_names:
         if canonical not in totals:
             continue
         count = counts.get(canonical, 0)
@@ -4316,6 +4327,16 @@ def _detail_card(item, kind):
         "category": category,
         "description": description,
         "options": options,
+        "slot": str(item.get("slotName") or item.get("slot") or "").strip(),
+        "slotRaw": str(item.get("slot") or item.get("slotId") or "").strip(),
+        "enchantLevel": int(_safe_num(item.get("enchantLevel")) or 0),
+        "exceedLevel": int(_safe_num(item.get("exceedLevel")) or 0),
+        "mainStats": item.get("mainStats") if isinstance(item.get("mainStats"), list) else [],
+        "subStats": item.get("subStats") if isinstance(item.get("subStats"), list) else [],
+        "magicStoneStat": item.get("magicStoneStat") if isinstance(item.get("magicStoneStat"), list) else [],
+        "godStoneStat": item.get("godStoneStat") if isinstance(item.get("godStoneStat"), list) else [],
+        "skillOptions": item.get("skillOptions") if isinstance(item.get("skillOptions"), list) else [],
+        "sources": item.get("sources") if isinstance(item.get("sources"), list) else [],
     }
 
 
@@ -4360,14 +4381,81 @@ def _cards_from_collections(collections, kind, limit=100):
 
 
 def extract_arcana(profile):
-    return _cards_from_collections(
-        _find_named_collections(
-            profile,
-            ("arcana", "arcanas", "arcanaList", "arcanaInfo", "equippedArcana"),
-        ),
-        "아르카나",
-        60,
-    )
+    """Extract equipped Arcana cards, including Arcana1..N item-detail slots."""
+    if not isinstance(profile, dict):
+        return []
+
+    cards = []
+    seen = set()
+    seen_names = set()
+
+    def slot_label(raw):
+        raw = str(raw or "").strip()
+        match = re.search(r"arcana\D*(\d+)", raw, re.IGNORECASE)
+        return f"아르카나 {match.group(1)}" if match else (raw or "아르카나")
+
+    def add(item, slot_hint=""):
+        card = _detail_card(item, "아르카나")
+        if not card:
+            return
+        raw_slot = str(card.get("slotRaw") or card.get("slot") or slot_hint or "").strip()
+        name_key = str(card.get("name") or "").casefold()
+        if not raw_slot and name_key in seen_names:
+            return
+        card["slotRaw"] = raw_slot
+        card["slot"] = slot_label(raw_slot)
+        key = (
+            raw_slot.casefold(),
+            str(card.get("name") or "").casefold(),
+            str(card.get("level") or card.get("enchantLevel") or ""),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        seen_names.add(name_key)
+        cards.append(card)
+
+    # The official item-detail response keys equipped cards as Arcana1, Arcana2,
+    # ... rather than exposing a standalone arcanaList.
+    def walk_slots(node, depth=0):
+        if depth > 10:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                is_slot = bool(re.match(r"^arcana\D*\d+$", str(key), re.IGNORECASE))
+                if is_slot and isinstance(value, dict):
+                    add(value, str(key))
+                elif isinstance(value, (dict, list)):
+                    walk_slots(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                if isinstance(value, (dict, list)):
+                    walk_slots(value, depth + 1)
+
+    walk_slots(profile)
+
+    # Support legacy payloads with explicit arcana collections too.
+    for collection in _find_named_collections(
+        profile,
+        ("arcana", "arcanas", "arcanaList", "arcanaInfo", "equippedArcana"),
+    ):
+        if isinstance(collection, list):
+            for index, item in enumerate(collection, 1):
+                if isinstance(item, dict):
+                    add(item, f"Arcana{index}")
+        elif isinstance(collection, dict):
+            if any(key in collection for key in ("name", "arcanaName", "displayName")):
+                add(collection)
+            else:
+                for key, value in collection.items():
+                    if isinstance(value, dict):
+                        add(value, str(key))
+
+    def order(card):
+        match = re.search(r"(\d+)", str(card.get("slotRaw") or card.get("slot") or ""))
+        return (int(match.group(1)) if match else 999, str(card.get("name") or ""))
+
+    return sorted(cards, key=order)[:60]
 
 
 def extract_skills(profile):
@@ -5332,6 +5420,9 @@ th{color:var(--muted);text-align:right}th:first-child,td:first-child{text-align:
 .stone-diff-wrap{margin-top:12px}.stone-diff-wrap table td:first-child{font-weight:800}
 @media(max-width:900px){.eq-compare{grid-template-columns:1fr}}
 
+.arcana-compare{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px}.arcana-owner{border:1px solid var(--line);border-radius:14px;padding:12px;background:#0b1524}.arcana-owner.a{border-color:#365f97}.arcana-owner.b{border-color:#674886}.arcana-owner-head{font-size:16px;font-weight:900;margin-bottom:10px}.arcana-owner.a .arcana-owner-head{color:#b9d5ff}.arcana-owner.b .arcana-owner-head{color:#dfc8ff}.arcana-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px}.arcana-card{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;border:1px solid #3f3561;border-radius:11px;background:#171329;padding:9px;min-height:82px}.arcana-icon{width:48px;height:48px;border-radius:9px;background:#241d3d;border:1px solid #5b4b82;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#d9c8ff;font-weight:900}.arcana-icon img{width:100%;height:100%;object-fit:cover}.arcana-slot{font-size:10px;color:#b995ff;font-weight:900}.arcana-name{font-size:13px;font-weight:900;margin-top:2px}.arcana-meta{font-size:10px;color:var(--muted);margin-top:3px}.arcana-options{grid-column:1/-1;display:grid;gap:3px;margin-top:2px}.arcana-option{font-size:11px;color:#dbe7f7;border-top:1px solid rgba(185,149,255,.16);padding-top:4px;line-height:1.3}.arcana-empty{color:var(--muted);padding:10px}
+@media(max-width:900px){.arcana-compare{grid-template-columns:1fr}}
+
 
 /* v75 requested UI: keep original theme, only requested compare blocks changed */
 .top-extra{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}.title-badge{background:#14243b;border:1px solid #2f4d73}.wing-badge{display:inline-flex;align-items:center;gap:5px}.wing-badge img{width:18px;height:18px;object-fit:contain}
@@ -5389,6 +5480,15 @@ th{color:var(--muted);text-align:right}th:first-child,td:first-child{text-align:
           <tr><td>마석 데이터 대기</td><td>—</td><td>—</td><td>—</td></tr>
         </tbody>
       </table>
+    </div>
+  </div>
+
+  <div class="panel section">
+    <div class="head">장착 아르카나 카드</div>
+    <div class="note">현재 장착 슬롯의 카드 이름과 확인 가능한 옵션·효과를 표시</div>
+    <div class="arcana-compare">
+      <div class="arcana-owner a"><div class="arcana-owner-head" id="arcanaHeadA">A 아르카나</div><div class="arcana-list" id="arcanaListA"><div class="arcana-empty">데이터 대기</div></div></div>
+      <div class="arcana-owner b"><div class="arcana-owner-head" id="arcanaHeadB">B 아르카나</div><div class="arcana-list" id="arcanaListB"><div class="arcana-empty">데이터 대기</div></div></div>
     </div>
   </div>
 
@@ -5503,6 +5603,35 @@ function renderStoneOwner(character, headId, listId){
 function renderStones(a,b){
   renderStoneOwner(a,"stoneHeadA","stoneListA");
   renderStoneOwner(b,"stoneHeadB","stoneListB");
+}
+
+function arcanaOptionTexts(card){
+  const out=[];
+  const add=text=>{text=String(text||'').trim();if(text&&!out.includes(text))out.push(text);};
+  ['mainStats','subStats','options','skillOptions','magicStoneStat','godStoneStat'].forEach(key=>{
+    (Array.isArray(card?.[key])?card[key]:[]).forEach(row=>{
+      if(typeof row==='string') add(row);
+      else if(row&&typeof row==='object') add(statText(row)||`${row.name||row.skillName||row.id||''} ${row.value??row.level??row.skillLevel??''}`);
+    });
+  });
+  add(card?.description);
+  return out.slice(0,8);
+}
+function renderArcanaOwner(character,headId,listId){
+  $(headId).textContent=`${character?.info?.name||'캐릭터'} 아르카나`;
+  const cards=Array.isArray(character?.arcana)?character.arcana:[];
+  if(!cards.length){$(listId).innerHTML='<div class="arcana-empty">확인된 장착 아르카나 없음</div>';return;}
+  $(listId).innerHTML=cards.map((r,i)=>{
+    const icon=r?.icon?`<img src="${E(r.icon)}" alt="">`:'A';
+    const level=Number(r?.enchantLevel||r?.level||0), exceed=Number(r?.exceedLevel||0);
+    const meta=[r?.grade,level>0?`+${level}`:'',exceed>0?`초월 ${exceed}`:''].filter(Boolean).join(' · ');
+    const options=arcanaOptionTexts(r);
+    return `<div class="arcana-card"><div class="arcana-icon">${icon}</div><div><div class="arcana-slot">${E(r?.slot||`아르카나 ${i+1}`)}</div><div class="arcana-name">${E(r?.name||'-')}</div><div class="arcana-meta">${E(meta||'장착 중')}</div></div>${options.length?`<div class="arcana-options">${options.map(x=>`<div class="arcana-option">${E(x)}</div>`).join('')}</div>`:''}</div>`;
+  }).join('');
+}
+function renderArcana(a,b){
+  renderArcanaOwner(a,'arcanaHeadA','arcanaListA');
+  renderArcanaOwner(b,'arcanaHeadB','arcanaListB');
 }
 
 function renderStoneDiff(a,b){
@@ -5673,6 +5802,7 @@ function render(d){
 
   renderStones(d.a,d.b);
   renderStoneDiff(d.a,d.b);
+  renderArcana(d.a,d.b);
   renderSkillCompare(d.a,d.b,'active');
   renderSkillCompare(d.a,d.b,'stigma');
   renderSkillCompare(d.a,d.b,'passive');
@@ -5736,9 +5866,11 @@ body.single-mode #compareBtn,
 body.single-mode #charB,
 body.single-mode .stone-owner.b,
 body.single-mode .stone-diff-wrap,
+body.single-mode .arcana-owner.b,
 body.single-mode .equip-detail-owner.b{display:none!important}
 body.single-mode .topgrid,
 body.single-mode .stone-compare,
+body.single-mode .arcana-compare,
 body.single-mode .equip-detail-compare{grid-template-columns:1fr!important}
 body.single-mode .skill-table th:nth-child(3),
 body.single-mode .skill-table td:nth-child(3),
@@ -5747,6 +5879,7 @@ body.single-mode .skill-table td:nth-child(4){display:none!important}
 body.single-mode .skill-table td:first-child{width:76%}
 body.single-mode .panel.a,
 body.single-mode .stone-owner.a,
+body.single-mode .arcana-owner.a,
 body.single-mode .equip-detail-owner.a{border-color:#365f97}
 </style>
 """
@@ -5881,13 +6014,13 @@ async def api_compare_character(nickname: str, server: str):
         # detailed_character_data() resolver, which can return characterId not found.
         data = await compare_character_data_db_first(nickname, server)
         return {
-            "version": "v77-official-outage-fallback",
+            "version": "v78-fast-search-stone-arcana",
             **data,
         }
     except Exception as e:
         return {
             "ok": False,
-            "version": "v77-official-outage-fallback",
+            "version": "v78-fast-search-stone-arcana",
             "error": f"{type(e).__name__}: {str(e)[:400]}",
         }
 
@@ -6194,11 +6327,18 @@ async def official_compare_character_data(nickname: str, server_name: str):
         })
 
     equipment_detailed = []
+    arcana_cards = []
     for item in src.get('items') or []:
         if not isinstance(item, dict) or not item.get('ok'):
             continue
         slot_raw = str(item.get('slot') or '')
-        if slot_raw.startswith('Arcana'):
+        if slot_raw.casefold().startswith('arcana'):
+            card = _detail_card(item, '아르카나')
+            if card:
+                slot_match = re.search(r'(\d+)', slot_raw)
+                card['slotRaw'] = slot_raw
+                card['slot'] = f"아르카나 {slot_match.group(1)}" if slot_match else '아르카나'
+                arcana_cards.append(card)
             continue
         equipment_detailed.append({
             'slot': _slot_group_label(slot_raw), 'slotRaw': slot_raw,
@@ -6214,6 +6354,11 @@ async def official_compare_character_data(nickname: str, server_name: str):
 
     _detail_slot_order = {name: i for i, name in enumerate(['주무기','보조','상의','하의','투구','어깨','장갑','신발','망토','허리띠','목걸이','귀걸이','반지','팔찌','브로치','룬','아뮬렛','펜던트'])}
     equipment_detailed.sort(key=lambda x: (_detail_slot_order.get(str(x.get('slot') or ''), 999), str(x.get('slotRaw') or ''), str(x.get('name') or '')))
+    arcana_cards.sort(key=lambda x: (
+        int(re.search(r'(\d+)', str(x.get('slotRaw') or '')).group(1))
+        if re.search(r'(\d+)', str(x.get('slotRaw') or '')) else 999,
+        str(x.get('name') or ''),
+    ))
 
     titles = _extract_equipped_titles(src.get('titleData'))
     petwing = src.get('petwingData') if isinstance(src.get('petwingData'), dict) else {}
@@ -6271,7 +6416,7 @@ async def official_compare_character_data(nickname: str, server_name: str):
         'combinedOffense': combined,
         'optionFeedback': option_feedback,
         'titleEffects': title_effects,
-        'arcana': [],
+        'arcana': arcana_cards,
         'skills': active,
         'stigma': stigma,
         'passives': passives,
@@ -6282,7 +6427,7 @@ async def official_compare_character_data(nickname: str, server_name: str):
             'detailSuccessCount': int(src.get('detailSuccessCount') or 0),
             'stoneGroupCount': len(magic_stones),
             'statCount': len(combined),
-            'arcanaCount': 0,
+            'arcanaCount': len(arcana_cards),
             'skillCount': len(active),
             'stigmaCount': len(stigma),
             'passiveCount': len(passives),
@@ -6498,7 +6643,7 @@ async def api_compare(
             return JSONResponse(
                 {
                     "ok": False,
-                    "version": "v77-official-outage-fallback",
+                    "version": "v78-fast-search-stone-arcana",
                     "message": " / ".join(messages) or "비교 데이터 준비 실패",
                     "a": a,
                     "b": b,
@@ -6514,7 +6659,7 @@ async def api_compare(
 
         return {
             "ok": True,
-            "version": "v77-official-outage-fallback",
+            "version": "v78-fast-search-stone-arcana",
             "a": a,
             "b": b,
             "proAnalysis": pro_analysis,
@@ -9415,7 +9560,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V18 ZIKEL GROUP2 SINGLE CARD"
+PWA_APP_VERSION = "V20 FAST SEARCH STONE ARCANA"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -10089,7 +10234,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-09-29-zikel-group2-single-card"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-10-02-fast-search-stone-arcana"}
 
 
 @app.get("/manifest.webmanifest")
