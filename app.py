@@ -9230,6 +9230,8 @@ def _schedule_alert_targets(now):
 async def _manual_schedule_command(name, clock_text):
     if name == "필보":
         name = "필드보스"
+    if _schedule_key(name) == "agro":
+        return "⚠️ 아그로 시간은 매일 09:00 / 21:00 고정이며 시간 보정을 적용할 수 없습니다."
     parsed = _parse_manual_clock(clock_text)
     if parsed is None:
         return "⚠️ 시간 형식은 21:00 또는 21시처럼 입력해주세요."
