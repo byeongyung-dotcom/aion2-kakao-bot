@@ -1389,6 +1389,9 @@ async def _official_get_json_live(url, params=None, timeout=None):
 
 
 CHARACTER_WARM_TASKS = set()
+CHARACTER_WARM_BY_KEY = {}
+CHARACTER_WARM_LAST_STARTED = {}
+CHARACTER_WARM_MIN_INTERVAL_SECONDS = 45.0
 
 
 async def _warm_official_character_detail(row, nickname):
@@ -1411,12 +1414,53 @@ async def _warm_official_character_detail(row, nickname):
         pass
 
 
-def _start_character_detail_warm(row, nickname):
-    """Keep a strong reference until the background detail refresh completes."""
+async def _warm_character_full_profile(row, nickname):
+    """Persist equipment/stones/Arcana without delaying the chat search."""
     try:
-        task = asyncio.create_task(_warm_official_character_detail(dict(row or {}), nickname))
-        CHARACTER_WARM_TASKS.add(task)
-        task.add_done_callback(CHARACTER_WARM_TASKS.discard)
+        sid = int(row.get("serverId") or 0)
+        server_name = str(row.get("serverName") or row.get("server") or "").strip()
+        if not server_name and sid:
+            server_name = str(SERVER_NAME_BY_ID.get(sid) or "").strip()
+        cid = str(row.get("characterId") or "").strip()
+        if not nickname or not server_name or not cid:
+            return
+        await _full_profile_for_exact_character(str(nickname).strip(), server_name)
+    except Exception:
+        pass
+
+
+def _start_character_detail_warm(row, nickname):
+    """Refresh identity/profile once per character without duplicate task storms."""
+    try:
+        row_copy = dict(row or {})
+        sid = int(row_copy.get("serverId") or 0)
+        cid = str(row_copy.get("characterId") or "").strip()
+        nick_key = str(nickname or "").strip().casefold()
+        if not sid or not cid or not nick_key:
+            return
+
+        factories = (
+            ("identity", lambda: _warm_official_character_detail(row_copy, nickname)),
+            ("profile", lambda: _warm_character_full_profile(row_copy, nickname)),
+        )
+        now_mono = time.monotonic()
+        for kind, factory in factories:
+            key = f"{kind}:{sid}:{cid}:{nick_key}"
+            existing = CHARACTER_WARM_BY_KEY.get(key)
+            if existing is not None and not existing.done():
+                continue
+            last_started = float(CHARACTER_WARM_LAST_STARTED.get(key) or 0.0)
+            if now_mono - last_started < CHARACTER_WARM_MIN_INTERVAL_SECONDS:
+                continue
+            task = asyncio.create_task(factory())
+            CHARACTER_WARM_BY_KEY[key] = task
+            CHARACTER_WARM_LAST_STARTED[key] = now_mono
+            CHARACTER_WARM_TASKS.add(task)
+            def cleanup(done_task, task_key=key):
+                CHARACTER_WARM_TASKS.discard(done_task)
+                if CHARACTER_WARM_BY_KEY.get(task_key) is done_task:
+                    CHARACTER_WARM_BY_KEY.pop(task_key, None)
+            task.add_done_callback(cleanup)
     except Exception:
         pass
 
@@ -1730,7 +1774,7 @@ async def own_resolve_character(nickname, server_name=None):
         asyncio.create_task(_fresh_notmeter_character(nickname, server_name)),
     }
     try:
-        for completed in asyncio.as_completed(lookup_tasks, timeout=29.0):
+        for completed in asyncio.as_completed(lookup_tasks, timeout=7.0):
             try:
                 resolved = await completed
             except Exception:
@@ -1752,7 +1796,7 @@ async def own_resolve_character(nickname, server_name=None):
     # 2) One bounded in-request retry only when there is still time.  A user should
     # never have to type the same command twice just to warm the upstream service.
     elapsed = time.monotonic() - resolve_started
-    if elapsed < 8.2:
+    if elapsed < 4.0:
         try:
             await asyncio.sleep(0.45)
             retry_timeout = 2.8 if server_name else 2.2
@@ -2714,35 +2758,19 @@ async def debug_official_equipped_stats_v2(nickname: str = '윤이', server: str
     cid = str(row.get('characterId') or '').strip()
     sid = int(row.get('serverId') or server_id)
 
-    # Fresh character/detail/compare data: clear only this character's official
-    # info/equipment/item caches before loading. This prevents an old 2m/30m
-    # snapshot from being shown after equipment or magic-stone changes.
-    for cache_key in list(_cache.keys()):
-        skey = str(cache_key)
-        if (
-            skey.startswith('official-json:')
-            and f'characterId={cid}' in skey
-            and f'serverId={sid}' in skey
-            and (
-                '/api/character/info' in skey
-                or '/api/character/equipment' in skey
-            )
-        ):
-            _cache.pop(cache_key, None)
-        elif skey.startswith(f'official-eq-item:{sid}:{cid}:'):
-            _cache.pop(cache_key, None)
-
     params = {'lang': 'ko', 'characterId': cid, 'serverId': sid}
     try:
-        equipment_payload = await _official_get_json(
-            f'{OFFICIAL_CHARACTER_BASE}/api/character/equipment',
-            params=params,
-            timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
-        )
-        info_payload = await _official_get_json(
-            OFFICIAL_CHARACTER_INFO_API,
-            params=params,
-            timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
+        equipment_payload, info_payload = await asyncio.gather(
+            _official_get_json(
+                f'{OFFICIAL_CHARACTER_BASE}/api/character/equipment',
+                params=params,
+                timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
+            ),
+            _official_get_json(
+                OFFICIAL_CHARACTER_INFO_API,
+                params=params,
+                timeout=httpx.Timeout(connect=15.0, read=20.0, write=4.0, pool=4.0),
+            ),
         )
     except Exception as e:
         return {'ok': False, 'error': f'official base API 실패: {type(e).__name__}: {str(e)[:300]}'}
@@ -2768,7 +2796,7 @@ async def debug_official_equipped_stats_v2(nickname: str = '윤이', server: str
                 'enchantLevel': enchant, 'exceedLevel': exceed, 'slotPos': slot_pos,
             }
             detail_cache_key = f"official-eq-item:{sid}:{cid}:{item_id}:{enchant}:{exceed}:{slot_pos}"
-            cached_detail = cache_get(detail_cache_key, 1800)
+            cached_detail = cache_get(detail_cache_key, 120)
             if isinstance(cached_detail, dict):
                 data = cached_detail
                 return {
@@ -2952,6 +2980,46 @@ async def debug_official_equipped_stats_v2(nickname: str = '윤이', server: str
     }
 
 
+OFFICIAL_EQUIPPED_SHARED_LOCKS = {}
+OFFICIAL_EQUIPPED_CACHE_SECONDS = 60
+
+
+async def _official_equipped_stats_shared(nickname: str, server_name: str):
+    """Deduplicate the expensive equipment crawl and reject partial snapshots."""
+    nickname = str(nickname or "").strip()
+    server_name = str(server_name or "").strip()
+    cache_key = f"official-equipped-complete:{server_name.casefold()}:{nickname.casefold()}"
+    cached = cache_get(cache_key, OFFICIAL_EQUIPPED_CACHE_SECONDS)
+    if isinstance(cached, dict) and cached.get("ok"):
+        return cached
+
+    lock = OFFICIAL_EQUIPPED_SHARED_LOCKS.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached = cache_get(cache_key, OFFICIAL_EQUIPPED_CACHE_SECONDS)
+        if isinstance(cached, dict) and cached.get("ok"):
+            return cached
+
+        data = await debug_official_equipped_stats_v2(
+            nickname=nickname,
+            server=server_name,
+        )
+        if not isinstance(data, dict) or not data.get("ok"):
+            return data if isinstance(data, dict) else {"ok": False, "error": "official load failed"}
+
+        equipment_count = int(data.get("equipmentCount") or 0)
+        success_count = int(data.get("detailSuccessCount") or 0)
+        if equipment_count <= 0 or success_count != equipment_count:
+            return {
+                "ok": False,
+                "error": f"official item detail incomplete ({success_count}/{equipment_count})",
+                "equipmentCount": equipment_count,
+                "detailSuccessCount": success_count,
+            }
+
+        cache_set(cache_key, data)
+        return data
+
+
 
 def _official_magic_stone_totals(src):
     """Single source of truth for NC official equipped magic-stone totals."""
@@ -3066,7 +3134,7 @@ async def character_card_data(nickname: str, server_name: str):
                     _cache.pop(key, None)
 
             src = await asyncio.wait_for(
-                debug_official_equipped_stats_v2(
+                _official_equipped_stats_shared(
                     nickname=str(info.get("name") or nickname),
                     server=str(info.get("server") or server_name),
                 ),
@@ -5085,7 +5153,18 @@ def build_character_option_feedback(character):
 
 
 
+FULL_PROFILE_LOAD_LOCKS = {}
+
+
 async def _full_profile_for_exact_character(nickname: str, server_name: str):
+    """Serialize first-time profile fills for the same nickname/server."""
+    key = f"{str(server_name or '').strip().casefold()}:{str(nickname or '').strip().casefold()}"
+    lock = FULL_PROFILE_LOAD_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        return await _full_profile_for_exact_character_unlocked(nickname, server_name)
+
+
+async def _full_profile_for_exact_character_unlocked(nickname: str, server_name: str):
     """
     v59 self-DB first:
       1) use the last saved detailed profile immediately when present;
@@ -5913,6 +5992,19 @@ window.addEventListener("DOMContentLoaded", async () => {{
     // to the current compare site's data/UI implementation.
     render({{ok:true,a:d,b:d,proAnalysis:{{}}}});
     const h=d.dataHealth||{{}};
+    const retryKey=`aion2-detail-warm:${{NAME}}:${{SERVER}}`;
+    if(d.warming) {{
+      const retryCount=Number(sessionStorage.getItem(retryKey)||0);
+      if(retryCount<2) {{
+        sessionStorage.setItem(retryKey,String(retryCount+1));
+        $("loadStatus").textContent=`${{NAME}} · ${{SERVER}} 상세 장비·마석·아르카나 저장 중 · 잠시 후 자동 재조회`;
+        setTimeout(()=>location.reload(),4500);
+      }} else {{
+        $("loadStatus").textContent=`${{NAME}} · ${{SERVER}} 기본 정보 표시 · 외부 상세 서버 응답 지연`;
+      }}
+      return;
+    }}
+    sessionStorage.removeItem(retryKey);
     $("loadStatus").textContent=
       `${{d.info?.name||NAME}} · ${{d.info?.server||SERVER}} · `+
       `마석 ${{h.stoneGroupCount||0}}종 · `+
@@ -6014,13 +6106,13 @@ async def api_compare_character(nickname: str, server: str):
         # detailed_character_data() resolver, which can return characterId not found.
         data = await compare_character_data_db_first(nickname, server)
         return {
-            "version": "v78-fast-search-stone-arcana",
+            "version": "v80-character-pipeline-audit",
             **data,
         }
     except Exception as e:
         return {
             "ok": False,
-            "version": "v78-fast-search-stone-arcana",
+            "version": "v80-character-pipeline-audit",
             "error": f"{type(e).__name__}: {str(e)[:400]}",
         }
 
@@ -6031,9 +6123,21 @@ async def official_compare_character_data(nickname: str, server_name: str):
     nickname = str(nickname or "").strip()
     server_name = str(server_name or "").strip()
 
-    # Compare must reflect the current official character state. Load live first;
-    # only use the persistent snapshot when NC is temporarily unavailable.
-    src = await debug_official_equipped_stats_v2(nickname=nickname, server=server_name)
+    # A complete snapshot produced within the same one-minute freshness window
+    # is already current enough and avoids crawling every equipped item again.
+    fresh_saved = await character_db_get_official_compare(
+        nickname, server_name, max_age_seconds=OFFICIAL_EQUIPPED_CACHE_SECONDS
+    )
+    if isinstance(fresh_saved, dict) and fresh_saved.get("ok"):
+        fresh_saved = dict(fresh_saved)
+        health = dict(fresh_saved.get("dataHealth") or {})
+        health["cache"] = "persistent-fresh"
+        fresh_saved["dataHealth"] = health
+        return fresh_saved
+
+    # Outside the short freshness window, load live and only use an older
+    # persistent snapshot when NC is temporarily unavailable.
+    src = await _official_equipped_stats_shared(nickname, server_name)
     if not isinstance(src, dict) or not src.get("ok"):
         saved = await character_db_get_official_compare(
             nickname, server_name, max_age_seconds=None
@@ -6515,9 +6619,17 @@ async def compare_character_data_db_first(nickname: str, server_name: str):
         basic = infos[0] if infos else {}
         if not basic and not row:
             return {"ok": False, "error": f"{nickname}[{server_name}] 저장 데이터 없음"}
+        warm_row = row or {
+            "name": basic.get("name") or nickname,
+            "serverName": basic.get("server") or server_name,
+            "serverId": int(basic.get("serverId") or SERVER_ID_MAP[server_name]),
+            "characterId": basic.get("characterId") or "",
+        }
+        _start_character_detail_warm(warm_row, nickname)
         return {
-            "ok": False,
-            "error": f"{nickname}[{server_name}] 상세 비교 데이터가 아직 저장되지 않음 · 캐릭터 조회를 한 번 실행 후 다시 비교",
+            "ok": True,
+            "warming": True,
+            "profileAvailable": False,
             "info": basic or profile_info({}, nickname, server_name, row or {}),
             "equipment": [], "magicStoneTotals": [], "stats": [],
             "combinedOffense": [], "optionFeedback": {}, "arcana": [],
@@ -6643,7 +6755,7 @@ async def api_compare(
             return JSONResponse(
                 {
                     "ok": False,
-                    "version": "v78-fast-search-stone-arcana",
+                    "version": "v80-character-pipeline-audit",
                     "message": " / ".join(messages) or "비교 데이터 준비 실패",
                     "a": a,
                     "b": b,
@@ -6659,7 +6771,7 @@ async def api_compare(
 
         return {
             "ok": True,
-            "version": "v78-fast-search-stone-arcana",
+            "version": "v80-character-pipeline-audit",
             "a": a,
             "b": b,
             "proAnalysis": pro_analysis,
@@ -7178,19 +7290,20 @@ def format_one_boss(cache, query):
 #
 # Abyss rift/event schedules are separate and must not overwrite the boss schedule.
 
-AGRO_RESPAWN_HOURS = 12
+# 2026-10 official schedule change:
+# - Agro no longer spawns from the server-open/maintenance anchor.
+# - It appears at the two fixed daily clocks below.
+AGRO_FIXED_TIMES = ((9, 0), (21, 0))
+OUTLAND_MATCH_WINDOWS = (((11, 0), (13, 30)), ((20, 0), (23, 30)))
+# Alerts fire only for the first match of each Outland window.
+OUTLAND_ALERT_TIMES = ((11, 0), (20, 0))
+
+AGRO_RESPAWN_HOURS = 12  # legacy persisted data compatibility; no longer used for scheduling
 KAIRA_FIXED_HOURS = (1, 5, 9, 13, 17, 21)
 
 def next_agro_from_latest_maintenance(latest_maintenance_end, now_kst):
-    if latest_maintenance_end is None:
-        return None
-
-    anchor = latest_maintenance_end
-    # Move forward in exact 12h increments until future.
-    nxt = anchor
-    while nxt <= now_kst:
-        nxt += timedelta(hours=AGRO_RESPAWN_HOURS)
-    return nxt
+    # Kept for older callers, but maintenance no longer controls Agro.
+    return _next_daily_times(AGRO_FIXED_TIMES, now_kst)
 
 
 DEFAULT_BOSS_RULES = {
@@ -7943,6 +8056,7 @@ def _schedule_key(name):
         "시공": "sigong", "시공쟁탈전": "sigong",
         "균영": "gyunyeol", "균열": "gyunyeol", "균열지대": "gyunyeol",
         "아티": "ati", "아티쟁": "ati",
+        "아웃랜드": "outland", "아웃랜드 경기": "outland", "아웃랜드경기": "outland",
         "필드보스": "fieldboss", "필보": "fieldboss",
     }
     return aliases.get(key)
@@ -8042,6 +8156,7 @@ def _clear_schedule_delivery_keys(name, room=""):
         "sigong": "시공쟁탈전",
         "gyunyeol": "균열지대",
         "ati": "아티쟁",
+        "outland": "아웃랜드",
         "fieldboss": "필드보스",
     }.get(_schedule_key(name))
     room_key = _openchat_room_key(room)
@@ -8940,9 +9055,9 @@ async def refresh_boss_rules(force=False):
     Policy:
     - Weekly/daily content clocks are fixed published schedules; explicit manual
       corrections can still be saved.
-    - Only Agro uses the confirmed maintenance END as its respawn anchor.
-    - Maintenance may suppress alerts while active, but it never shifts fixed
-      Sigong/Rift/Artifact/Abyss/Field-Boss clock times.
+    - Agro is fixed at 09:00/21:00 and does not use a maintenance anchor.
+    - Maintenance may suppress alerts while active, but it never shifts any
+      fixed Agro/Sigong/Rift/Artifact/Abyss/Field-Boss clock times.
     """
     now_ts = time.time()
     if not force and now_ts - float(_boss_rule_refresh.get("ts") or 0) < 300:
@@ -8957,20 +9072,13 @@ async def refresh_boss_rules(force=False):
     return BOSS_RULES
 
 def next_agro_from_anchor(anchor, now=None):
-    now = now or datetime.now(KST)
-    interval = timedelta(hours=int(BOSS_RULES["agroIntervalHours"]))
-
-    if now < anchor:
-        return anchor
-
-    elapsed = now - anchor
-    steps = int(elapsed.total_seconds() // interval.total_seconds()) + 1
-    return anchor + (interval * steps)
+    # The anchor argument remains for API compatibility only.
+    return _next_daily_times(AGRO_FIXED_TIMES, now or datetime.now(KST))
 
 def agro_targets(anchor, count=4, now=None):
-    first = next_agro_from_anchor(anchor, now=now)
-    interval = timedelta(hours=int(BOSS_RULES["agroIntervalHours"]))
-    return [first + (interval * i) for i in range(count)]
+    now = now or datetime.now(KST)
+    rows = _yunbot_v8_daily_occurrences(AGRO_FIXED_TIMES, now)
+    return [row for row in rows if row > now][:max(0, int(count))]
 
 def _kaira_times():
     data = _load_boss_schedule_overrides()
@@ -9024,9 +9132,7 @@ def _date_clock(dt):
     return f"{dt.month}/{dt.day} {dt.strftime('%H:%M')}"
 
 async def format_agro_schedule():
-    await refresh_boss_rules()
-    anchor = await latest_maintenance_anchor()
-    targets = agro_targets(anchor, count=4)
+    targets = agro_targets(None, count=4)
 
     lines = ["🐲 정령왕 아그로", ""]
     for target in targets:
@@ -9034,8 +9140,8 @@ async def format_agro_schedule():
 
     lines += [
         "",
-        f"기준 : 최근 점검 종료 {_date_clock(anchor)}",
-        f"주기 : {int(BOSS_RULES['agroIntervalHours'])}시간",
+        "고정 출현 : 매일 09:00 / 21:00",
+        "정기 점검 직후에는 등장하지 않으며 이후 지정 시간에 등장",
     ]
     return "\n".join(lines)
 
@@ -9043,9 +9149,7 @@ async def format_all_core_bosses():
     await refresh_boss_rules()
 
     now = datetime.now(KST)
-    anchor = await latest_maintenance_anchor()
-
-    agro = next_agro_from_anchor(anchor, now)
+    agro = next_agro_from_anchor(None, now)
     kaira = _next_daily_times(_kaira_times(), now)
     nahma = _next_weekly(
         BOSS_RULES["nahmaWeekdays"],
@@ -9074,8 +9178,20 @@ async def format_all_core_bosses():
         lines.append(f"⏰ {_date_clock(target)}")
         lines.append("")
 
-    lines.append(f"아그로 기준 점검 종료 : {_date_clock(anchor)}")
+    lines.append("아그로 : 매일 09:00 / 21:00 고정")
     return "\n".join(lines)
+
+
+def format_outland_schedule():
+    return "\n".join([
+        "⚔️ 아웃랜드 경기",
+        "",
+        "오전 : 매일 11:00 ~ 13:30",
+        "오후 : 매일 20:00 ~ 23:30",
+        "경기 : 30분 간격",
+        "",
+        "알림 : 각 구간 첫 경기(11:00 / 20:00) 30분 전·10분 전",
+    ])
 
 def _format_weekly_content(command_name):
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
@@ -9105,6 +9221,7 @@ def _schedule_alert_targets(now):
         ("content", "시공쟁탈전", _next_weekly_multi(BOSS_RULES["sigongWeekdays"], BOSS_RULES["sigongTimes"], now)),
         ("content", "균열지대", _next_weekly_multi(BOSS_RULES["gyunyeolWeekdays"], BOSS_RULES["gyunyeolTimes"], now)),
         ("content", "아티쟁", _next_weekly_multi(BOSS_RULES["atiWeekdays"], BOSS_RULES["atiTimes"], now)),
+        ("content", "아웃랜드", _next_daily_times(OUTLAND_ALERT_TIMES, now)),
         ("boss", "필드보스", _next_weekly_multi(BOSS_RULES["fieldBossWeekdays"], BOSS_RULES["fieldBossTimes"], now)),
     ]
     return targets
@@ -9174,6 +9291,8 @@ async def field_boss_lookup(query=None):
         return _format_weekly_content("균열")
     if q in ("아티", "아티쟁"):
         return _format_weekly_content("아티")
+    if q in ("아웃랜드", "아웃랜드경기"):
+        return format_outland_schedule()
     if q == "필드보스":
         return _format_weekly_content("필드보스")
 
@@ -9560,7 +9679,7 @@ async def board_lookup(command: str):
 # =========================================================
 # Tablet PWA launcher
 # =========================================================
-PWA_APP_VERSION = "V20 FAST SEARCH STONE ARCANA"
+PWA_APP_VERSION = "V23 FIXED AGRO OUTLAND"
 PWA_HOME_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -9677,7 +9796,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <button id="notifyOffBtn" class="notifybtn off">끄기</button>
           </div>
         </div>
-        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 30분 전·10분 전, 공지/CM/업데이트, 점검으로 인한 아그로 시간 변경을 갤럭시탭 알림으로 받습니다.</div>
+        <div class="notifyhelp">앱을 닫아도 필보·콘텐츠 30분 전·10분 전, 공지/CM/업데이트 알림을 받습니다. 아그로는 매일 09:00/21:00, 아웃랜드는 각 구간 첫 경기 11:00/20:00만 알림합니다.</div>
         <div class="notifytools">
           <button id="notifySettingsBtn" class="notifybtn">⚙️ 알림 설정</button>
           <button id="notifyNextBtn" class="notifybtn">⏱️ 다음 알림</button>
@@ -9685,7 +9804,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button id="notifyHealthBtn" class="notifybtn">🛡️ 시스템 상태</button>
           <button id="test30Btn" class="notifybtn test">30분 테스트</button>
           <button id="test10Btn" class="notifybtn test">10분 테스트</button>
-          <button id="testAgroBtn" class="notifybtn test">아그로 변경 테스트</button>
+          <button id="testAgroBtn" class="notifybtn test">아그로 알림 테스트</button>
           <button id="fullCheckBtn" class="notifybtn">✅ 전체 자가진단</button>
           <button id="backupBtn" class="notifybtn">💾 설정 백업</button>
           <button id="restoreBtn" class="notifybtn">♻️ 설정 복원</button>
@@ -9707,6 +9826,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <label class="checkchip"><input data-schedule="sigong" type="checkbox" checked>시공</label>
             <label class="checkchip"><input data-schedule="gyunyeol" type="checkbox" checked>균열</label>
             <label class="checkchip"><input data-schedule="ati" type="checkbox" checked>아티</label>
+            <label class="checkchip"><input data-schedule="outland" type="checkbox" checked>아웃랜드</label>
             <label class="checkchip"><input data-schedule="fieldboss" type="checkbox" checked>필드보스</label>
           </div>
           <div class="settinglabel">소식 / 변경</div>
@@ -9714,7 +9834,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <label class="checkchip"><input data-board="공지" type="checkbox" checked>공지</label>
             <label class="checkchip"><input data-board="CM" type="checkbox" checked>CM</label>
             <label class="checkchip"><input data-board="업데이트" type="checkbox" checked>업데이트</label>
-            <label class="checkchip"><input id="maintenanceAgro" type="checkbox" checked>아그로 변경</label>
+            <label class="checkchip" style="display:none"><input id="maintenanceAgro" type="checkbox">아그로 변경(사용 안 함)</label>
           </div>
           <button id="saveNotifyPrefs" class="saveprefs">설정 저장</button>
           <div class="nextline">설정 저장 후부터 새 알림에 적용됩니다.</div>
@@ -9733,6 +9853,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
             <label class="checkchip"><input data-favboss="sigong" type="checkbox">시공</label>
             <label class="checkchip"><input data-favboss="gyunyeol" type="checkbox">균열</label>
             <label class="checkchip"><input data-favboss="ati" type="checkbox">아티</label>
+            <label class="checkchip"><input data-favboss="outland" type="checkbox">아웃랜드</label>
             <label class="checkchip"><input data-favboss="fieldboss" type="checkbox">필드보스</label>
           </div>
           <button id="saveFavBoss" class="saveprefs">즐겨찾기 저장</button>
@@ -9747,6 +9868,7 @@ h1{font-size:24px;margin:0}.sub{font-size:13px;color:var(--muted);margin-top:4px
           <button class="btn" data-cmd="시공">시공</button>
           <button class="btn" data-cmd="균열">균열</button>
           <button class="btn" data-cmd="아티">아티</button>
+          <button class="btn" data-cmd="아웃랜드">아웃랜드</button>
         </div>
       </div>
 
@@ -9810,6 +9932,7 @@ const BOSS_META={
   sigong:{name:'시공쟁탈전',short:'시공',cmd:'시공'},
   gyunyeol:{name:'균열지대',short:'균열',cmd:'균열'},
   ati:{name:'아티쟁',short:'아티',cmd:'아티'},
+  outland:{name:'아웃랜드',short:'아웃랜드',cmd:'아웃랜드'},
   fieldboss:{name:'필드보스',short:'필드보스',cmd:'필보'}
 };
 let latestNextItems=[];
@@ -10234,7 +10357,7 @@ self.addEventListener('notificationclick',event=>{
 
 @app.get("/api/app/version")
 async def pwa_app_version():
-    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-10-02-fast-search-stone-arcana"}
+    return {"ok": True, "version": PWA_APP_VERSION, "build": "2026-10-28-fixed-agro-outland"}
 
 
 @app.get("/manifest.webmanifest")
@@ -10668,7 +10791,7 @@ h2{{margin:0 0 12px}}p{{color:#d1d5db;line-height:1.6}}a{{color:#93c5fd}}
 # server schedule.  Room-specific corrections never mutate it.
 # =========================================================
 
-YUNBOT_SNAPSHOT_VERSION = "v8-room-schedule-2026-09-07"
+YUNBOT_SNAPSHOT_VERSION = "v8-room-schedule-2026-10-28-agro-outland"
 
 
 def _yunbot_v8_occurrence(dt):
@@ -10751,33 +10874,8 @@ def _yunbot_v8_weekly_occurrences(weekdays, times, now=None):
 
 
 def _yunbot_v8_agro_occurrences(anchor, now=None):
-    now = now or datetime.now(KST)
-    if anchor is None:
-        return []
-    try:
-        interval_hours = max(1, int(BOSS_RULES.get("agroIntervalHours", 4)))
-    except Exception:
-        interval_hours = 4
-    interval = timedelta(hours=interval_hours)
-    interval_seconds = interval.total_seconds()
-    try:
-        steps = int((now - anchor).total_seconds() // interval_seconds)
-    except Exception:
-        steps = 0
-
-    out = []
-    seen = set()
-    # Keep several previous/future occurrences so local room offsets can
-    # cross the common event clock without disappearing after that clock.
-    for i in range(steps - 3, steps + 10):
-        dt = anchor + interval * i
-        key = int(dt.timestamp())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(dt)
-    out.sort()
-    return out
+    # The anchor is intentionally ignored under the fixed 09:00/21:00 policy.
+    return _yunbot_v8_daily_occurrences(AGRO_FIXED_TIMES, now)
 
 
 def _yunbot_v8_pack_schedule(key, name, item_type, occurrences):
@@ -10818,12 +10916,9 @@ async def openchat_schedule_snapshot(room: str = "YUNBOT", room_alias: str = "�
     source_id = str(official_info.get("sourceId") or "")
     source_title = str(official_info.get("sourceTitle") or "")
 
-    generation_anchor = official_anchor or common_agro_anchor or AGRO_FALLBACK_ANCHOR
-    generation = source_id
-    if generation_anchor is not None:
-        generation = (generation + "|" if generation else "") + generation_anchor.astimezone(KST).strftime("%Y%m%d%H%M")
-    if not generation:
-        generation = "fallback"
+    # Fixed schedules must not create a new phone generation when maintenance
+    # changes. Stable slot keys already protect every room from duplicates.
+    generation = "fixed-agro-outland-20261028"
 
     schedules = []
 
@@ -10880,6 +10975,11 @@ async def openchat_schedule_snapshot(room: str = "YUNBOT", room_alias: str = "�
             BOSS_RULES.get("atiTimes") or [],
             now,
         ),
+    ))
+
+    schedules.append(_yunbot_v8_pack_schedule(
+        "outland", "아웃랜드", "content",
+        _yunbot_v8_daily_occurrences(OUTLAND_ALERT_TIMES, now),
     ))
 
     schedules.append(_yunbot_v8_pack_schedule(
@@ -10972,83 +11072,18 @@ async def openchat_alerts(room: str = "", room_alias: str = ""):
         first_run = not delivery.get("initialized")
         items = []
 
-        # Maintenance-driven Agro change, kept pending until phone ACK.
+        # Agro is now fixed at 09:00/21:00. Maintenance metadata is retained for
+        # maintenance suppression/diagnostics only; it must never shift Agro or
+        # emit an old pending "Agro time changed" alert after this deployment.
         try:
             maint = _persisted_official_agro_info()
             current_source = str(maint.get("sourceId") or "")
             current_anchor = maint.get("anchor")
-            seen_source = str(delivery.get("maintenanceSourceId") or "")
-            seen_anchor = _parse_kst_iso(delivery.get("maintenanceAnchor"))
-            pending = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
-            if not seen_source and current_source and current_anchor is not None:
+            if current_source:
                 delivery["maintenanceSourceId"] = current_source
+            if current_anchor is not None:
                 delivery["maintenanceAnchor"] = current_anchor.astimezone(KST).isoformat()
-            elif current_source and current_anchor is not None and (
-                current_source != seen_source or seen_anchor is None or current_anchor != seen_anchor
-            ):
-                pending_anchor = current_anchor.astimezone(KST).strftime("%Y%m%d%H%M")
-                pending_key = (
-                    "MAINT|"
-                    + re.sub(r"[^0-9A-Za-z_-]", "", current_source)[:100]
-                    + "|" + pending_anchor
-                )
-                if not pending or str(pending.get("key") or "") != pending_key:
-                    delta = _maintenance_clock_delta_minutes(seen_anchor, current_anchor) if seen_anchor else 0
-                    if delta:
-                        nxt = next_agro_from_anchor(current_anchor, now)
-                        pending = {
-                            "key": pending_key,
-                            "sourceId": current_source,
-                            "anchor": current_anchor.astimezone(KST).isoformat(),
-                            "oldTime": seen_anchor.strftime("%H:%M") if seen_anchor else "기존",
-                            "newTime": current_anchor.strftime("%H:%M"),
-                            "shiftMinutes": int(delta),
-                            "nextAgro": nxt.strftime("%m/%d %H:%M") if nxt else "",
-                            "title": str(maint.get("sourceTitle") or "점검 일정 변경"),
-                            "changeKind": str(maint.get("changeKind") or ""),
-                        }
-                        delivery["maintenancePending"] = pending
-                    else:
-                        delivery["maintenanceSourceId"] = current_source
-                        delivery["maintenanceAnchor"] = current_anchor.astimezone(KST).isoformat()
-                        delivery["maintenancePending"] = None
-            pending = delivery.get("maintenancePending") if isinstance(delivery.get("maintenancePending"), dict) else None
-            if pending and str(pending.get("key") or ""):
-                shift = int(pending.get("shiftMinutes") or 0)
-                sign = "+" if shift > 0 else ""
-                old_time = str(pending.get("oldTime") or "")
-                new_time = str(pending.get("newTime") or "")
-                next_agro_text = str(pending.get("nextAgro") or "")
-                notice_title = str(pending.get("title") or "")
-                change_kind = str(pending.get("changeKind") or "")
-                if change_kind == "extension" or (shift > 0 and "연장" in notice_title):
-                    change_header = "🔧 점검 연장"
-                elif change_kind in ("early_end", "completion") and shift < 0:
-                    change_header = "✅ 점검 조기 종료"
-                elif change_kind == "schedule_change":
-                    change_header = "🔧 점검 시간 변경"
-                else:
-                    change_header = "🔧 아그로 시간 변경"
-                maintenance_message = (
-                    change_header + "\n\n"
-                    f"점검 종료: {old_time} → {new_time}\n"
-                    f"변경폭: {sign}{shift}분\n"
-                    f"다음 아그로: {next_agro_text}"
-                )
-                if notice_title:
-                    maintenance_message += f"\n\n공지: {notice_title}"
-                items.append({
-                    "type": "maintenance_change",
-                    "title": "아그로 시간 변경",
-                    "message": maintenance_message,
-                    "oldTime": old_time,
-                    "newTime": new_time,
-                    "shiftMinutes": shift,
-                    "shiftText": f"{sign}{shift}분",
-                    "nextAgro": next_agro_text,
-                    "noticeTitle": notice_title,
-                    "key": str(pending.get("key") or ""),
-                })
+            delivery["maintenancePending"] = None
         except Exception:
             pass
 
@@ -11608,6 +11643,7 @@ PWA_SCHEDULE_NAMES = {
     "sigong": "시공쟁탈전",
     "gyunyeol": "균열지대",
     "ati": "아티쟁",
+    "outland": "아웃랜드",
     "fieldboss": "필드보스",
 }
 
@@ -11737,7 +11773,7 @@ def _pwa_push_payload(item):
         return {
             "title": f"🐲 {name} {lead}분 전",
             "body": f"{when} 예정{late_note} · AION2 TOOL에서 확인하세요.",
-            "url": "/?cmd=" + quote(({"agro":"아그로","kaira":"카이라","nahma":"나흐마","abyss":"어비스","sigong":"시공","gyunyeol":"균열","ati":"아티","fieldboss":"필보"}.get(_schedule_key(name)) or "필보"), safe=""),
+            "url": "/?cmd=" + quote(({"agro":"아그로","kaira":"카이라","nahma":"나흐마","abyss":"어비스","sigong":"시공","gyunyeol":"균열","ati":"아티","outland":"아웃랜드","fieldboss":"필보"}.get(_schedule_key(name)) or "필보"), safe=""),
             "tag": "schedule-" + key,
         }
     return {
@@ -11873,83 +11909,8 @@ def _agro_phase_shift_minutes(old_anchor, new_anchor):
 
 
 def _pwa_maintenance_change_candidate(now=None):
-    """Return one pending maintenance-driven Agro schedule change.
-
-    The first observed maintenance source is only a baseline. A notification is
-    created only when a genuinely newer maintenance source changes the 12-hour
-    Agro phase. The marker is advanced only after a successful push, so a
-    transient push failure is retried on the next check.
-    """
-    now = now or datetime.now(KST)
-    data = _load_boss_schedule_overrides()
-    current = data.get("agroOfficial") if isinstance(data.get("agroOfficial"), dict) else {}
-    source_id = str(current.get("sourceId") or "").strip()
-    source_title = str(current.get("sourceTitle") or "").strip()
-    new_anchor = _parse_kst_iso(current.get("anchor"))
-    if not source_id or new_anchor is None:
-        return None
-
-    marker = data.get("pwaMaintenanceAlert") if isinstance(data.get("pwaMaintenanceAlert"), dict) else {}
-    marker_source = str(marker.get("sourceId") or "").strip()
-    old_anchor = _parse_kst_iso(marker.get("anchor"))
-
-    # First run after this feature is installed: establish a baseline without
-    # sending an old maintenance notice as if it were new.
-    if not marker.get("initialized"):
-        data["pwaMaintenanceAlert"] = {
-            "initialized": True,
-            "sourceId": source_id,
-            "sourceTitle": source_title,
-            "anchor": new_anchor.isoformat(),
-            "updatedAt": now.isoformat(),
-        }
-        _save_boss_schedule_overrides(data)
-        return None
-
-    if marker_source == source_id:
-        return None
-
-    phase_delta = _agro_phase_shift_minutes(old_anchor, new_anchor)
-
-    # A new maintenance notice with the same 12-hour Agro phase does not change
-    # Agro spawn times. Advance the marker silently so it is not reconsidered.
-    if old_anchor is not None and phase_delta == 0:
-        data["pwaMaintenanceAlert"] = {
-            "initialized": True,
-            "sourceId": source_id,
-            "sourceTitle": source_title,
-            "anchor": new_anchor.isoformat(),
-            "updatedAt": now.isoformat(),
-        }
-        _save_boss_schedule_overrides(data)
-        return None
-
-    next_agro = next_agro_from_anchor(new_anchor, now)
-    old_clock = old_anchor.strftime("%H:%M") if old_anchor is not None else "기존"
-    new_clock = new_anchor.strftime("%H:%M")
-    if phase_delta > 0:
-        shift_text = f"+{phase_delta // 60}시간 {phase_delta % 60}분" if phase_delta % 60 else f"+{phase_delta // 60}시간"
-    elif phase_delta < 0:
-        mins = abs(phase_delta)
-        shift_text = f"-{mins // 60}시간 {mins % 60}분" if mins % 60 else f"-{mins // 60}시간"
-    else:
-        shift_text = "변경"
-
-    body = f"점검 종료 {old_clock} → {new_clock} · 아그로 {shift_text} · 다음 {next_agro.strftime('%m/%d %H:%M')}"
-    if source_title:
-        body += f"\n{source_title[:70]}"
-
-    return {
-        "sourceId": source_id,
-        "sourceTitle": source_title,
-        "anchor": new_anchor,
-        "payload": {
-            "title": "⚠️ 아그로 시간 변경",
-            "body": body,
-            "url": "/?cmd=" + quote("아그로", safe=""),
-            "tag": "agro-maintenance-" + re.sub(r"[^0-9A-Za-z_-]", "", source_id)[:80],
-        },
-    }
+    """Maintenance never changes the fixed 09:00/21:00 Agro schedule."""
+    return None
 
 
 def _pwa_mark_maintenance_change_sent(candidate, now=None):
@@ -12567,7 +12528,7 @@ async def character_card_data_fast(nickname: str, server_name: str):
                 total = float(row.get("total") or 0)
             except Exception:
                 continue
-            pct = any(x in name for x in ("증폭", "피해", "강타", "완벽"))
+            pct = name in PERCENT_CANONICAL_STATS
             stones.append((name, "+" + pretty_number(total) + ("%" if pct else "")))
     except Exception:
         pass
@@ -12684,10 +12645,7 @@ async def character_card_stones_latest(name: str = "", server: str = ""):
         # detail/compare. Do not use get_profile(fast=True) or an old full-profile
         # snapshot here; those can briefly show the right value and then overwrite
         # it with stale stone totals.
-        src = await debug_official_equipped_stats_v2(
-            nickname=nickname,
-            server=server_name,
-        )
+        src = await _official_equipped_stats_shared(nickname, server_name)
         if isinstance(src, dict) and src.get("ok"):
             fresh_stones = _official_magic_stones_for_card(src)
             if fresh_stones:
@@ -13613,7 +13571,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
     # Boss/content alert lead correction:
     # !아그로 25분전 / !시공 25분전 10분전 / !아그로 알림 25 10
     m_alert_lead = re.fullmatch(
-        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|필보|필드보스)\s+(?:(?:알림)\s+)?((?:\d{1,3}\s*(?:분전|분\s*전)?)(?:\s+\d{1,3}\s*(?:분전|분\s*전)?)*?)",
+        r"(아그로|카이라|나흐마|어비스|어비스보스|시공|균영|균열|균열지대|아티|아티쟁|아웃랜드|필보|필드보스)\s+(?:(?:알림)\s+)?((?:\d{1,3}\s*(?:분전|분\s*전)?)(?:\s+\d{1,3}\s*(?:분전|분\s*전)?)*?)",
         body,
     )
     if m_alert_lead and ("분" in body or "알림" in body):
@@ -13635,7 +13593,7 @@ async def openchat(msg: str = "", room: str = "", room_alias: str = ""):
             result = "⚠️ 시간 수정 실패"
         return PlainTextResponse(result, media_type="text/plain; charset=utf-8")
 
-    if body in ("시공", "시공쟁탈전", "균영", "균열", "균열지대", "아티", "아티쟁", "필드보스"):
+    if body in ("시공", "시공쟁탈전", "균영", "균열", "균열지대", "아티", "아티쟁", "아웃랜드", "아웃랜드경기", "필드보스"):
         try:
             result = await asyncio.wait_for(field_boss_lookup(body), timeout=8.0)
         except Exception:
@@ -13823,36 +13781,16 @@ async def _official_resolve_character_strict(nickname: str, server: str):
             sid = d.get('serverId') or d.get('server_id') or server_id
             nm = d.get('name') or nickname
             if cid and int(sid or 0) == server_id and str(nm).casefold() == nickname.casefold():
-                # Do not trust an old persisted characterId blindly. A deleted/recreated
-                # or otherwise stale identity used to make compare fail before re-search.
-                try:
-                    live = await _official_get_json_live(
-                        OFFICIAL_CHARACTER_INFO_API,
-                        params={
-                            'lang': 'ko',
-                            'characterId': str(cid),
-                            'serverId': server_id,
-                        },
-                        timeout=httpx.Timeout(connect=15.0, read=8.0, write=3.0, pool=3.0),
-                    )
-                    profile = live.get('profile') if isinstance(live, dict) else {}
-                    live_name = _strip_html(
-                        (profile or {}).get('name')
-                        or (profile or {}).get('characterName')
-                        or (live or {}).get('name')
-                    )
-                    if live_name and live_name.casefold() == nickname.casefold():
-                        return {
-                            'name': live_name,
-                            'serverName': d.get('serverName') or d.get('server_name') or d.get('server') or server,
-                            'serverId': server_id,
-                            'characterId': str(cid),
-                            'identitySource': 'db-live-validated',
-                        }
-                except Exception:
-                    # Continue into official search below instead of failing compare
-                    # on a stale DB identity.
-                    pass
+                # The equipment request itself validates the characterId.  Doing
+                # another live info request here added up to eight seconds before
+                # every comparison and duplicated the next info call.
+                return {
+                    'name': str(nm),
+                    'serverName': d.get('serverName') or d.get('server_name') or d.get('server') or server,
+                    'serverId': server_id,
+                    'characterId': str(cid),
+                    'identitySource': 'db-exact',
+                }
     except Exception:
         pass
 
